@@ -88,5 +88,5 @@ python code/init_pose.py --object_name 006_mustard_bottle --train_iters 15000
 }
 ```
 
-## License
-See `LICENSE` for details.
+## Copyright
+See `LICENSE` for details. THIS SOFTWARE AND/OR DATA WAS DEPOSITED IN THE BAIR OPEN RESEARCH COMMONS REPOSITORY ON Sep 1 2025.
