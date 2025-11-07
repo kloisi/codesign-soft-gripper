@@ -109,6 +109,7 @@ class InitializeFingers:
                  add_random=False,
                  init_height_offset=0.0,
                  post_height_offset=0.0, 
+                 finger_num=2,
                  is_ood=False,):
         self.pose_id = pose_id
         self.verbose = verbose
@@ -142,7 +143,7 @@ class InitializeFingers:
             raise ValueError("finger_len should be odd number")
         if finger_rot < 0.0 or finger_rot > np.pi/4:
             raise ValueError("finger_rot should be in [0, pi/4]")
-        self.finger_num = 2
+        self.finger_num = finger_num
         self.finger_len = finger_len # need to be odd number
         self.finger_rot = finger_rot
         self.finger_width = finger_width
@@ -190,72 +191,108 @@ class InitializeFingers:
         self.use_cuda_graph = False
     
     def build_rigid_model(self, object_rot):
+        # --- build the soft finger geometry (all fingers) ---
         soft_builder = TendonModelBuilder()
-        soft_builder.init_builder_tendon_variables(self.finger_num, self.finger_len, self.scale, self.requires_grad)
+        soft_builder.init_builder_tendon_variables(
+            self.finger_num, self.finger_len, self.scale, self.requires_grad
+        )
         self.init_transforms, finger_actual_len, finger_THK = soft_builder.build_fem_model(
             finger_width=self.finger_width,
             finger_rot=self.finger_rot,
             obj_loader=None,
             h_dis_init=0.2,
-            is_triangle=self.is_triangle,)
+            is_triangle=self.is_triangle,
+        )
         for init_trans in self.init_transforms:
-            print("init transforms:", wp.transform_get_translation(init_trans), wp.transform_get_rotation(init_trans))
+            print(
+                "init transforms:",
+                wp.transform_get_translation(init_trans),
+                wp.transform_get_rotation(init_trans),
+            )
 
-        # seperate two fingers into two meshs
-        v_num, face_num = len(soft_builder.particle_q), len(soft_builder.tri_indices)
-        vertices_0, vertices_1 = soft_builder.particle_q[:v_num // 2], soft_builder.particle_q[v_num // 2:]
-        faces_0, faces_1 = soft_builder.tri_indices[:face_num // 2], soft_builder.tri_indices[:face_num // 2]
-        finger_mesh = [wp.sim.Mesh(vertices_0, faces_0), wp.sim.Mesh(vertices_1, faces_1)]
-        self.finger_mesh = [wp.array(vertices_0, dtype=wp.vec3, requires_grad=True),
-                            wp.array(vertices_1, dtype=wp.vec3, requires_grad=True)]
-        self.curr_finger_mesh = [wp.array(vertices_0, dtype=wp.vec3, requires_grad=True), 
-                                 wp.array(vertices_1, dtype=wp.vec3, requires_grad=True)]
-        
+        # --- build per-finger meshes using recorded ranges ---
+        finger_mesh = []
+        self.finger_mesh = []
+        self.curr_finger_mesh = []
+
+        # REQUIRE: soft_builder.finger_vertex_ranges / finger_face_ranges are populated
+        for i in range(self.finger_num):
+            vs, ve = soft_builder.finger_vertex_ranges[i]
+            fs, fe = soft_builder.finger_face_ranges[i]
+
+            vertices_i = soft_builder.particle_q[vs:ve]
+            faces_i    = soft_builder.tri_indices[fs:fe]
+
+            finger_mesh.append(wp.sim.Mesh(vertices_i, faces_i))
+            self.finger_mesh.append(wp.array(vertices_i, dtype=wp.vec3, requires_grad=True))
+            self.curr_finger_mesh.append(wp.array(vertices_i, dtype=wp.vec3, requires_grad=True))
+
+        # --- start assembling the rigid scene used for initialization ---
         self.builder = wp.sim.ModelBuilder()
         self.builder.add_articulation()
 
         if self.is_ood:
             curr_dir = os.path.dirname(os.path.realpath(__file__))
             self.obj_loader.data_dir = curr_dir + "/../models/ood/"
-        
-        self.object_com, self.obj_body_id, self.obj_geo_id = utils.load_object(
-                        self.builder, self.obj_loader,
-                          object=self.obj_name,
-                          ycb_object_name=self.ycb_object_name,
-                          obj_rot=object_rot,
-                          scale=self.scale,
-                          use_simple_mesh=False,
-                          is_fix=True
-                          )
 
+        # object body + geometry
+        self.object_com, self.obj_body_id, self.obj_geo_id = utils.load_object(
+            self.builder,
+            self.obj_loader,
+            object=self.obj_name,
+            ycb_object_name=self.ycb_object_name,
+            obj_rot=object_rot,
+            scale=self.scale,
+            use_simple_mesh=False,
+            is_fix=True,
+        )
+
+        # create finger rigid bodies
         self.finger_body_idx = []
         for _ in range(self.finger_num):
             self.finger_body_idx.append(
-                self.builder.add_body(origin=wp.transform_identity()))
+                self.builder.add_body(origin=wp.transform_identity())
+            )
 
-        self.finger_shape_ids = []
+        # wrist body is free; fingers connect via prismatic joints
         wrist_body = self.builder.add_body(origin=wp.transform_identity())
         self.builder.add_joint_free(parent=-1, child=wrist_body)
-        limit_low, limit_upp = 1*finger_THK, 6*finger_THK 
+
+        # contact/thickness-based limits (same for all prismatic joints for now)
+        limit_low, limit_upp = 1 * finger_THK, 6 * finger_THK
         self.limit_low, self.limit_upp = limit_low, limit_upp
 
+        # add collision shapes for each finger
+        self.finger_shape_ids = []
         for i in range(self.finger_num):
             finger_shape_id = self.builder.add_shape_mesh(
-                body=self.finger_body_idx[i], 
-                                        mesh=finger_mesh[i], 
-                                        density=1e1,
-                                        ke=1.0e2,
-                                        kd=1.0e-5,
-                                        kf=1e1,
-                                        mu=1.0)
+                body=self.finger_body_idx[i],
+                mesh=finger_mesh[i],
+                density=1e1,
+                ke=1.0e2,
+                kd=1.0e-5,
+                kf=1e1,
+                mu=1.0,
+            )
             self.finger_shape_ids.append(finger_shape_id)
-        self.builder.add_joint_prismatic(parent=wrist_body, child=self.finger_body_idx[0], axis=wp.vec3(1.0, 0.0, 0.0), limit_lower=-limit_upp, limit_upper=-limit_low)
-        self.builder.add_joint_prismatic(parent=wrist_body, child=self.finger_body_idx[1], axis=wp.vec3(1.0, 0.0, 0.0), limit_lower=limit_low, limit_upper=limit_upp)
-        self.limit_low, self.limit_upp = [limit_low, limit_upp]
-        
+
+        # add prismatic joints for all fingers (x-axis). You can customize axes/limits per finger later.
+        self.prismatic_ids = []
+        for i in range(self.finger_num):
+            jid = self.builder.add_joint_prismatic(
+                parent=wrist_body,
+                child=self.finger_body_idx[i],
+                axis=wp.vec3(1.0, 0.0, 0.0),
+                limit_lower=-limit_upp,
+                limit_upper= limit_upp,
+            )
+            self.prismatic_ids.append(jid)
+
+        # finalize and load initial pose
         self.model = self.builder.finalize(requires_grad=True)
-        self.load_grasp_pose(self.pose_id)
-        
+        self.load_grasp_pose(self.pose_id)  # make sure this now sets 7 + finger_num DOFs
+
+        # collision margin
         self.model.object_contact_margin = self.stop_margin * self.scale
 
     def load_grasp_pose(self, pose_id):

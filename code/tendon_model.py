@@ -447,6 +447,10 @@ class TendonModelBuilder(ModelBuilder):
         self.waypoint_pair_ids = [[] for _ in range(finger_num)]
         self.waypoints_tri_indices = [[] for _ in range(finger_num)]
 
+        self.finger_vertex_ranges = []
+        self.finger_face_ranges = []
+        self.finger_particle_offsets = []
+
     def build_fem_model(self, 
                         finger_width=0.06, finger_rot=0.3,
                         h_dis_init=0.2,
@@ -473,30 +477,71 @@ class TendonModelBuilder(ModelBuilder):
         finger_height = cell_dim[2]*cell_size[2]
 
         h_dis = 0.0
-        pos_offset = np.array([0.0, h_dis, -finger_height/2]) 
-        rot = wp.quat_rpy(0.0, 0.0, -math.pi/2 - finger_rot) #top
-        transform = wp.transform(pos_offset, rot)
-        if finger_transform:
-            transform = finger_transform[0]
-        self.add_finger(
-            cell_dim, cell_size, conn_dim, conn_size, 
-            transform=transform,
-            index=0,
-            is_triangle=is_triangle)
-        finger_transforms.append(transform)
         
-        pos_offset = np.array([finger_width*s/2, h_dis, finger_height/2]) # top
-        pos_offset = np.array([0.0, h_dis, finger_height/2])
-        rot = wp.quat_rpy(math.pi, 0.0, -math.pi/2 + finger_rot) #top
-        transform = wp.transform(pos_offset, rot)
-        if finger_transform:
-            transform = finger_transform[1]
-        self.add_finger(
-            cell_dim, cell_size, conn_dim, conn_size, 
-            transform=transform, 
-            index=1,
-            is_triangle=is_triangle)
-        finger_transforms.append(transform)
+        # --- helper to generate default transforms if none were provided ---
+        def _default_transform(i):
+            if self.finger_num == 1:
+                # keep your original two-finger placement
+                if i == 0:
+                    pos = np.array([0.0, h_dis, -finger_height/2])
+                    rot = wp.quat_rpy(0.0, 0.0, -math.pi/2 - finger_rot)  # top
+                else:
+                    pos = np.array([0.0, h_dis,  finger_height/2])
+                    rot = wp.quat_rpy(math.pi, 0.0, -math.pi/2 + finger_rot)  # bottom
+                return wp.transform(pos, rot)
+            else:
+            # radius based on finger reach with a little clearance
+                R = finger_height/2
+
+                # place i-th finger on a circle around Y
+                theta = 2.0 * math.pi * (i / max(1, self.finger_num))
+                x = R * math.cos(theta)
+                z = R * math.sin(theta)
+                pos = np.array([x, h_dis, z])
+
+                # face the origin: yaw so local +X points to (-x, 0, -z)
+                yaw_inward = math.atan2(-z, -x)
+
+                # same small pinch as before, alternating sign
+                yaw = yaw_inward + (finger_rot if (i % 2 == 0) else -finger_rot)
+
+                # alternate a 180° roll to mirror the contact face (like top/bottom)
+                roll = 0.0 if (i % 2 == 0) else math.pi
+                pitch = 0.0
+
+                rot = wp.quat_rpy(roll, pitch, yaw)
+                return wp.transform(pos, rot)
+
+        # if a list of transforms was passed in, use it; otherwise generate
+        transforms = []
+        for i in range(self.finger_num):
+            if finger_transform and len(finger_transform) == self.finger_num:
+                transforms.append(finger_transform[i])
+            else:
+                transforms.append(_default_transform(i))
+
+        # FINAL model geometry is built by repeatedly calling add_finger
+        for i in range(self.finger_num):
+            # ---- record starts ----
+            v_start = len(self.particle_q)
+            f_start = len(self.tri_indices)
+
+            self.add_finger(
+                cell_dim, cell_size, conn_dim, conn_size,
+                transform=transforms[i],
+                index=i,
+                is_triangle=is_triangle,
+            )
+            finger_transforms.append(transforms[i])
+
+            # ---- record ends ----
+            v_end = len(self.particle_q)
+            f_end = len(self.tri_indices)
+
+            # ---- store ranges/offsets ----
+            self.finger_vertex_ranges.append((v_start, v_end))
+            self.finger_face_ranges.append((f_start, f_end))
+            self.finger_particle_offsets.append(v_start)
         
         self.model = self.finalize(requires_grad=self.requires_grad)
 
