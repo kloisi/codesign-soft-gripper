@@ -480,36 +480,30 @@ class TendonModelBuilder(ModelBuilder):
         
         # --- helper to generate default transforms if none were provided ---
         def _default_transform(i):
-            if self.finger_num == 1:
+            if self.finger_num == 2:
                 # keep your original two-finger placement
                 if i == 0:
                     pos = np.array([0.0, h_dis, -finger_height/2])
-                    rot = wp.quat_rpy(0.0, 0.0, -math.pi/2 - finger_rot)  # top
+                    rot = wp.quat_rpy(math.pi, 0.0, -math.pi/2 - finger_rot)  # top
                 else:
                     pos = np.array([0.0, h_dis,  finger_height/2])
                     rot = wp.quat_rpy(math.pi, 0.0, -math.pi/2 + finger_rot)  # bottom
                 return wp.transform(pos, rot)
             else:
-            # radius based on finger reach with a little clearance
-                R = finger_height/2
+                # --- general case: N >= 3 ---
+                # use a radius proportional to finger length, not thickness
+                R = max(finger_height, finger_LEN * 2.0)   # tweak 0.5 as you like
+                plane_y = h_dis
 
-                # place i-th finger on a circle around Y
-                theta = 2.0 * math.pi * (i / max(1, self.finger_num))
+                # evenly spaced in angle
+                theta = 2.0 * math.pi * (i / float(self.finger_num))
                 x = R * math.cos(theta)
                 z = R * math.sin(theta)
-                pos = np.array([x, h_dis, z])
+                pos = np.array([x, plane_y, z])
 
-                # face the origin: yaw so local +X points to (-x, 0, -z)
-                yaw_inward = math.atan2(-z, -x)
-
-                # same small pinch as before, alternating sign
-                yaw = yaw_inward + (finger_rot if (i % 2 == 0) else -finger_rot)
-
-                # alternate a 180° roll to mirror the contact face (like top/bottom)
-                roll = 0.0 if (i % 2 == 0) else math.pi
-                pitch = 0.0
-
-                rot = wp.quat_rpy(roll, pitch, yaw)
+                # keep orientation similar to the good-looking top finger:
+                # all fingers have the same "downward" orientation
+                rot = wp.quat_rpy(math.pi, 0.0, -math.pi/2)
                 return wp.transform(pos, rot)
 
         # if a list of transforms was passed in, use it; otherwise generate
