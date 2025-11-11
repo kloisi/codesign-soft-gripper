@@ -349,7 +349,7 @@ class InitializeFingers:
             self.transform_9d.copy_(wp.to_torch(self.transform_9d_wp))
             self.transform_2d.copy_(wp.to_torch(self.transform_2d_wp))
 
-        for i in range(2):
+        for i in range(self.finger_num):
             self.curr_finger_mesh[i] = wp.array(self.finger_mesh[i].numpy(), dtype=wp.vec3, requires_grad=True)
         self.sim_time = 0.0
         self.render_time = 0.0

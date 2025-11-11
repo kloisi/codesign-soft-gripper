@@ -64,6 +64,7 @@ class FEMTendon:
                  ycb_object_name='',
                  object_density=1e1,
                  finger_len=9, finger_rot=np.pi/9, finger_width=0.08, scale=4.0, finger_transform=None,
+                 finger_num=2,
                  init_finger=None):
         self.verbose = verbose
         self.save_log = save_log
@@ -81,7 +82,7 @@ class FEMTendon:
 
         self.obj_loader = ObjectLoader()
         self.finger_len = finger_len # need to be odd number
-        self.finger_num = 2
+        self.finger_num = finger_num
         self.finger_rot = finger_rot
         self.finger_width = finger_width
         self.finger_transform = finger_transform
@@ -371,6 +372,7 @@ if __name__ == "__main__":
     parser.add_argument("--log_prefix", type=str, default="", help="Prefix for the log file.")
     parser.add_argument("--pose_id", type=int, default=0, help="Initial pose id from anygrasp")
     parser.add_argument("--random", action="store_true", help="Add random noise to the initial position.")
+    parser.add_argument("--finger_num", type=int, default=2, help="Number of fingers.")
 
     args = parser.parse_known_args()[0]
 
@@ -397,6 +399,7 @@ if __name__ == "__main__":
                             is_render=False,
                             is_triangle=is_triangle,
                             pose_id=args.pose_id,
+                            finger_num=args.finger_num,
                             add_random=args.random,)
             
         tendon = FEMTendon(
@@ -417,6 +420,7 @@ if __name__ == "__main__":
             finger_width=finger_width,
             scale=scale,
             finger_transform=finger_transform,
+            finger_num=args.finger_num,
             init_finger=init_finger)
 
         for i in range(args.pose_iters):
