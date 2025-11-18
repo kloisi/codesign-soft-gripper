@@ -83,7 +83,7 @@ def calculate_force(
     blend_factor = wp.smoothstep(0.0, threshold, wp.length(tendon_f_dir))
     f_dir = blend_factor * wp.normalize(tendon_f_dir) + (1.0 - blend_factor) * wp.vec3(0.0, 0.0, 0.0)
 
-    f = np.dot(external_force[finger_id] * tendon_direction, f_dir) * f_dir
+    f = wp.dot(external_force[finger_id] * tendon_direction, f_dir) * f_dir
     wp.atomic_add(waypoint_activations, tid, f)
 
 @wp.kernel
@@ -480,7 +480,7 @@ class TendonModelBuilder(ModelBuilder):
         
         # --- helper to generate default transforms if none were provided ---
         def _default_transform(i):
-            if self.finger_num == 2:
+            if self.finger_num == 1:
                 # keep your original two-finger placement
                 if i == 0:
                     pos = np.array([0.0, h_dis, -finger_height/2])

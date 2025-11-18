@@ -529,6 +529,7 @@ if __name__ == "__main__":
     parser.add_argument("--object_name", type=str, default="013_apple", help="Name of the object to load.")
     parser.add_argument("--verbose", action="store_true", help="Print out additional status messages during execution.")
     parser.add_argument("--random", action="store_true", help="Add randomness to the loaded pose.")
+    parser.add_argument("--finger_num", type=int, default=2, help="Number of fingers.")
 
     args = parser.parse_known_args()[0]
     finger_transform, end_state = None, None
@@ -553,6 +554,7 @@ if __name__ == "__main__":
                                     is_triangle=False,
                                     #    pose_id=args.pose_id,
                                     pose_id=this_pose_id,
+                                    finger_num=args.finger_num,
                                     add_random=args.random)
             finger_transform, jq = tendon.get_initial_position()
             if finger_transform is None:
