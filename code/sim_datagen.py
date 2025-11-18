@@ -360,7 +360,7 @@ if __name__ == "__main__":
         default="sim",
         help="Path to the output USD file.",
     )
-    parser.add_argument("--num_frames", type=int, default=850, help="Total number of frames per training iteration.")
+    parser.add_argument("--num_frames", type=int, default=500, help="Total number of frames per training iteration.")
     parser.add_argument("--stiff_iters", type=int, default=3, help="Total number of sampling stiffness iterations.")
     parser.add_argument("--pose_iters", type=int, default=3, help="Total number of pose iterations.")
     parser.add_argument("--object_name", type=str, default="006_mustard_bottle", help="Name of the object to load.")

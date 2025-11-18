@@ -413,7 +413,8 @@ def multi_transform_to11d(trans: wp.array(dtype=wp.float32), # 9d
         transform_9d[offset_9d + i + 3] = R[i // 3, i % 3]
         
     # prismatic joint
-    for i in range(2):
+    N = transform_2d.shape[0]
+    for i in range(N):
         transform_2d[offset_2d + i] = trans[env_offset + i + 7]
 
 @wp.kernel
@@ -455,7 +456,8 @@ def multi_transform_from11d(transform_9d: wp.array(dtype=float),
     q = wp.transform_get_rotation(T)
     for i in range(4):
         trans[env_offset + i + 3] = q[i]
-    for i in range(2):
+    N = transform_2d.shape[0]
+    for i in range(N):
         trans[env_offset + i + 7] = transform_2d[offset_2d + i]
         
 @wp.func

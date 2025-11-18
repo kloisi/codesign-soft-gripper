@@ -158,7 +158,9 @@ class InitializeFingers:
         self.object_com = wp.to_torch(self.object_com, requires_grad=True)
         self.joint_q = wp.array(self.model.joint_q.numpy(), dtype=wp.float32, requires_grad=True)
         self.transform_9d_wp= wp.zeros(9, dtype=wp.float32, requires_grad=True)
-        self.transform_2d_wp= wp.zeros(2, dtype=wp.float32, requires_grad=True)
+        # for arbitrary number of points (e.g. one value per finger)
+        self.transform_2d_wp = wp.zeros(self.finger_num, dtype=wp.float32, requires_grad=True)
+
 
         wp.launch(utils.transform_to11d, dim=1,
                   inputs=[self.joint_q],
@@ -333,7 +335,19 @@ class InitializeFingers:
         t_gb[1] += self.init_height_offset
 
         R_quat = utils.mat33_to_quat(R_gb)
-        self.model.joint_q = wp.array(t_gb.tolist() + R_quat.flatten().tolist() + [-self.limit_upp, self.limit_upp], dtype=wp.float32, requires_grad=True)
+        finger_init = []
+        for i in range(self.finger_num):
+            # Example: left half negative, right half positive, or all zero, etc.
+            if i < self.finger_num // 2:
+                finger_init.append(-self.limit_upp)
+            else:
+                finger_init.append(self.limit_upp)
+
+        self.model.joint_q = wp.array(
+            t_gb.tolist() + R_quat.flatten().tolist() + finger_init,
+            dtype=wp.float32,
+            requires_grad=True,
+        )
 
     def reset_states(self):
         self.joint_q = wp.array(self.model.joint_q.numpy(), dtype=wp.float32, requires_grad=True)
@@ -392,8 +406,14 @@ class InitializeFingers:
 
         self.optimizer.step(closure)
         with torch.no_grad():
-            self.transform_2d[0].clamp_(-self.limit_upp, -self.limit_low)
-            self.transform_2d[1].clamp_(self.limit_low, self.limit_upp)
+            for i in range(self.finger_num):
+                if i < self.finger_num // 2:
+                    # “left side” − fingers should be negative
+                    self.transform_2d[i].clamp_(-self.limit_upp, -self.limit_low)
+                else:
+                    # “right side” − fingers should be positive
+                    self.transform_2d[i].clamp_(self.limit_low, self.limit_upp)
+
         if iter % 1000 == 0:
             print("iter:", iter, "loss:", self.loss)
 
@@ -536,7 +556,8 @@ if __name__ == "__main__":
                                     add_random=args.random)
             finger_transform, jq = tendon.get_initial_position()
             if finger_transform is None:
-                finger_transform = np.zeros([2, 7])
+                finger_transform = np.zeros([tendon.finger_num, 7])
+
             transform_arr.append(finger_transform)
 
             # break
