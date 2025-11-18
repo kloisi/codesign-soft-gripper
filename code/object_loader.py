@@ -17,7 +17,7 @@ class ObjectLoader:
             body=-1, pos=pos,
             hx=box_x, hy=box_height/2, hz=box_width/2,
             mu=0.1, density=1e2)
-        self.mid_height = box_height/3
+        self.mid_height = box_height/3 # did they mess up here?
 
     def add_box(self, builder, box_x, box_height, box_width, pos: np.array, rot: wp.quat, scale: float):
         self.obj_name = 'box'
@@ -38,7 +38,7 @@ class ObjectLoader:
     def add_ycb(self, builder, 
                 pos: np.array, rot: wp.quat, 
                 scale: float, 
-                ke=1.0e-5, kd=1.0e-1,
+                ke=1.0e6, kd=5.0e1, # default was ke=1.0e-5, kd=1.0e-1,
                 kf=1e1, mu=1.0,
                 obj_name='006_mustard_bottle',
                 use_simple_mesh=False, is_fix=False,

@@ -3,6 +3,7 @@ import warp as wp
 import warp.sim.render
 from warp.sim.model import *
 import utils
+import math
 
 @wp.kernel
 def calculate_surface_normals(
@@ -452,7 +453,9 @@ class TendonModelBuilder(ModelBuilder):
                         h_dis_init=0.2,
                         obj_loader=None, 
                         finger_transform=None,
-                        is_triangle=False):
+                        is_triangle=False,
+                        add_cloth=False, ###
+                        cloth_res=(32, 32)): ###
         s = self.scale
         self.finger_transform = finger_transform
 
@@ -497,7 +500,47 @@ class TendonModelBuilder(ModelBuilder):
             index=1,
             is_triangle=is_triangle)
         finger_transforms.append(transform)
-        
+
+        #########################################################
+        # add cloth grid
+        #########################################################
+        if add_cloth:
+            cloth_dim_x, cloth_dim_y = cloth_res # cloth grid resolution
+            cloth_cell = 0.01 * s # base cell size, scaled with s
+
+            Lx = cloth_dim_x * cloth_cell
+            Ly = cloth_dim_y * cloth_cell
+
+            # approximate vertical placement, make sure the cloth starts over the fingers/ YCB Object:
+            # make sure the cloth starts over the fingers/ YCB Object:
+            mid_h = 0.0
+            if obj_loader is not None and hasattr(obj_loader, "mid_height"):
+                mid_h = float(obj_loader.mid_height)
+
+            object_top = 2.0 * mid_h # Top of YCB object is 2 * mid_height
+
+            cloth_y = object_top + 0.1 * s  # margin above object
+            # cloth_y = mid_h + finger_height + 0.05 * s
+
+            cloth_pos = wp.vec3(-0.5 * Lx, cloth_y, -0.5 * Ly) # center of cloth in center above YCB Object
+
+            # orientation:
+            self.add_cloth_grid(
+                pos=cloth_pos,
+                rot=wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), math.pi * 0.5), # grid in x-z plane
+                vel=wp.vec3(0.0, 0.0, 0.0),
+                dim_x=cloth_dim_x,
+                dim_y=cloth_dim_y,
+                cell_x=cloth_cell,
+                cell_y=cloth_cell,
+                mass=0.05,
+                fix_left=False, # fully free falling cloth (in template it's fixed)
+                tri_ke=1.0e3,
+                tri_ka=1.0e3,
+                tri_kd=1.0e1,
+            )
+
+        # finalize model (now includes fingers, cloth, YCB object)
         self.model = self.finalize(requires_grad=self.requires_grad)
 
         radii = wp.zeros(self.model.particle_count, dtype=wp.float32)

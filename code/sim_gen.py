@@ -116,7 +116,9 @@ class FEMTendon:
             finger_rot=self.finger_rot,
             obj_loader=self.obj_loader,
             finger_transform=self.finger_transform,
-            is_triangle=True
+            is_triangle=True,
+            add_cloth=True, # add cloth
+            cloth_res=(32, 32), # try different values
             )
         self.model = self.builder.model
         self.control = self.model.control(requires_grad=self.requires_grad)
@@ -229,7 +231,7 @@ class FEMTendon:
                 index = i + frame * self.sim_substeps
                 self.states[index].clear_forces()
                 self.tendon_holder.reset()
-                if i % 10 == 0:
+                if i % 1 == 0: # default was % 10, (computing collisions every 10 substeps)
                     wp.sim.collide(self.model, self.states[index])
                 
                 self.control.update_target_vel(frame)
@@ -349,7 +351,7 @@ if __name__ == "__main__":
         default="femtendon_sim.usd",
         help="Path to the output USD file.",
     )
-    parser.add_argument("--num_frames", type=int, default=1000, help="Total number of frames per training iteration.")
+    parser.add_argument("--num_frames", type=int, default=5000, help="Total number of frames per training iteration.") # changed number of frames to give enough time for the cloth to fall and deform
     parser.add_argument("--train_iters", type=int, default=1, help="Total number of training iterations.")
     parser.add_argument("--object_name", type=str, default="006_mustard_bottle", help="Name of the object to load.")
     parser.add_argument("--object_density", type=float, default=2e0, help="Density of the object.")
