@@ -490,10 +490,10 @@ class TendonModelBuilder(ModelBuilder):
                     rot = wp.quat_rpy(math.pi, 0.0, -math.pi/2 + finger_rot)  # bottom
                 return wp.transform(pos, rot)
             else:
-                # --- general case: N >= 3 ---
+                # --- general case
                 # use a radius proportional to finger length, not thickness
                 R = max(finger_height, finger_LEN * 2.0)   # tweak 0.5 as you like
-                plane_y = h_dis
+                plane_y = h_dis + finger_height * 10.0
 
                 # evenly spaced in angle
                 theta = 2.0 * math.pi * (i / float(self.finger_num))
@@ -501,9 +501,8 @@ class TendonModelBuilder(ModelBuilder):
                 z = R * math.sin(theta)
                 pos = np.array([x, plane_y, z])
 
-                # keep orientation similar to the good-looking top finger:
-                # all fingers have the same "downward" orientation
-                rot = wp.quat_rpy(math.pi, 0.0, -math.pi/2)
+                yaw = theta + math.pi
+                rot = wp.quat_rpy(yaw, 0.0, -math.pi/2)
                 return wp.transform(pos, rot)
 
         # if a list of transforms was passed in, use it; otherwise generate
