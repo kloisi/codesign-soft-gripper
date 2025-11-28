@@ -492,7 +492,7 @@ class TendonModelBuilder(ModelBuilder):
             else:
                 # --- general case
                 # use a radius proportional to finger length, not thickness
-                R = max(finger_height, finger_LEN * 2.0)   # tweak 0.5 as you like
+                R = max(finger_height, finger_LEN * 2.8)   # tweak 0.5 as you like
                 plane_y = h_dis + finger_height * 10.0
 
                 # evenly spaced in angle

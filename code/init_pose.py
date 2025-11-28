@@ -84,6 +84,7 @@ class ForwardKinematics(torch.autograd.Function):
         trans9d_grad.clamp_(-max_grad_trans, max_grad_trans)
         trans2d_grad.clamp_(-max_grad_trans, max_grad_trans)
         trans9d_grad[0].zero_()
+        #trans9d_grad[1].zero_()
         trans9d_grad[2].zero_()
         trans9d_grad[3:].zero_()
 
@@ -338,10 +339,12 @@ class InitializeFingers:
         finger_init = []
         for i in range(self.finger_num):
             # Example: left half negative, right half positive, or all zero, etc.
-            if i < self.finger_num // 2:
-                finger_init.append(-self.limit_upp)
-            else:
-                finger_init.append(self.limit_upp)
+            finger_init = [0.0] * self.finger_num
+
+            # if i < self.finger_num // 2:
+            #     finger_init.append(-self.limit_upp)
+            # else:
+            #     finger_init.append(self.limit_upp)
 
         self.model.joint_q = wp.array(
             t_gb.tolist() + R_quat.flatten().tolist() + finger_init,
