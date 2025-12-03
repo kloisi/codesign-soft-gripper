@@ -155,10 +155,11 @@ def target_vel(
 
     move_frame_id = 500
     offset_frame = 150
-    if frame_id > (move_frame_id-offset_frame)  and frame_id < move_frame_id:
-        target_vels[tid] = wp.vec3(0.0, 3e-4, 0.0)
-    elif frame_id > move_frame_id and frame_id < (move_frame_id+offset_frame):
-        target_vels[tid] = wp.vec3(0.0, -3e-4, 0.0)
+    # if frame_id > (move_frame_id-offset_frame)  and frame_id < move_frame_id:
+    #     target_vels[tid] = wp.vec3(0.0, 3e-4, 0.0)
+    # elif frame_id > move_frame_id and frame_id < (move_frame_id+offset_frame):
+    #     target_vels[tid] = wp.vec3(0.0, -3e-4, 0.0)
+    target_vels[tid] = wp.vec3(0.0, 0.0, 0.0)
 
 class TendonHolder:
     def __init__(self, model, control):
