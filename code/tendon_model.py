@@ -481,30 +481,20 @@ class TendonModelBuilder(ModelBuilder):
         
         # --- helper to generate default transforms if none were provided ---
         def _default_transform(i):
-            if self.finger_num == 1:
-                # keep your original two-finger placement
-                if i == 0:
-                    pos = np.array([0.0, h_dis, -finger_height/2])
-                    rot = wp.quat_rpy(math.pi, 0.0, -math.pi/2 - finger_rot)  # top
-                else:
-                    pos = np.array([0.0, h_dis,  finger_height/2])
-                    rot = wp.quat_rpy(math.pi, 0.0, -math.pi/2 + finger_rot)  # bottom
-                return wp.transform(pos, rot)
-            else:
-                # --- general case
-                # use a radius proportional to finger length, not thickness
-                R = max(finger_height, finger_LEN * 2.8)   # tweak 0.5 as you like
-                plane_y = h_dis + finger_height * 10.0
 
-                # evenly spaced in angle
-                theta = 2.0 * math.pi * (i / float(self.finger_num))
-                x = R * math.cos(theta)
-                z = R * math.sin(theta)
-                pos = np.array([x, plane_y, z])
+            # use a radius proportional to finger length, not thickness
+            R = max(finger_height, finger_LEN * 2.8)   # tweak 0.5 as you like
+            plane_y = h_dis + finger_height * 10.0
 
-                yaw = theta + math.pi
-                rot = wp.quat_rpy(yaw, 0.0, -math.pi/2)
-                return wp.transform(pos, rot)
+            # evenly spaced in angle
+            theta = 2.0 * math.pi * (i / float(self.finger_num))
+            x = R * math.cos(theta)
+            z = R * math.sin(theta)
+            pos = np.array([x, plane_y, z])
+
+            yaw = theta + math.pi
+            rot = wp.quat_rpy(yaw, 0.0, -math.pi/2)
+            return wp.transform(pos, rot)
 
         # if a list of transforms was passed in, use it; otherwise generate
         transforms = []
