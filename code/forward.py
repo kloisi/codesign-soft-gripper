@@ -161,6 +161,8 @@ class FEMTendon:
         self.obj_name = 'ycb'
         self.ycb_object_name = ycb_object_name
         self.object_density = object_density
+        self.has_object = bool(self.ycb_object_name)
+
 
         self.curr_dir = os.path.dirname(os.path.realpath(__file__))
         self.stage_path = self.curr_dir + "/../output/" + stage_path + f"{ycb_object_name}_{log_prefix}_frame{num_frames}" + ".usd"
@@ -232,9 +234,14 @@ class FEMTendon:
         for i in range(self.sim_substeps * self.num_frames + 1):
             self.states.append(self.model.state(requires_grad=self.requires_grad))
         self.init_particle_q = self.states[0].particle_q.numpy()[0, :]
-        self.init_body_q = self.states[0].body_q.numpy()[0, :]
-        self.object_body_f = self.states[0].body_f
-        self.object_q = self.states[0].body_q
+        if self.has_object:
+            self.init_body_q = self.states[0].body_q.numpy()[0, :]
+            self.object_body_f = self.states[0].body_f
+            self.object_q = self.states[0].body_q
+        else:
+            self.init_body_q = None
+            self.object_body_f = None
+            self.object_q = None
         self.object_grav = np.zeros(6)
         self.log_K_list = []
         self.save_list = []
@@ -350,6 +357,15 @@ class FEMTendon:
                 inputs=[self.kernel_seed + self.iter, 13.5, 17.0],
                 outputs=[self.log_K_warp])
         print(f"iter:{self.iter}, sampled log_K:", self.log_K_warp.numpy()[:10])
+
+        if not getattr(self, "has_object", True):
+            if self.use_cuda_graph:
+                wp.capture_launch(self.graph)
+            else:
+                self.forward()
+            self.sim_time += self.frame_dt
+            self.iter += 1
+            return
 
         # sample density
         new_density = np.random.uniform(1e0, 1e1)
@@ -562,7 +578,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_frames", type=int, default=1000, help="Total number of frames per training iteration.")
     parser.add_argument("--stiff_iters", type=int, default=3, help="Total number of sampling stiffness iterations.")
     parser.add_argument("--pose_iters", type=int, default=3, help="Total number of pose iterations.")
-    parser.add_argument("--object_name", type=str, default="006_mustard_bottle", help="Name of the object to load.")
+    parser.add_argument("--object_name", type=str, default="", help="Name of the object to load.")
     parser.add_argument("--object_density", type=float, default=2e0, help="Density of the object.")
     parser.add_argument("--verbose", action="store_true", help="Print out additional status messages during execution.")
     parser.add_argument("--no_init", action="store_true", help="Automatically initialize the fingers.")

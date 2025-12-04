@@ -665,6 +665,8 @@ def load_object(builder, obj_loader,
                  density=1e1,
                  use_simple_mesh=True,
                  is_fix=False):
+    if not ycb_object_name:
+        return
     s = scale
     object_com = None
     if object == 'box':
