@@ -577,8 +577,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--num_frames", type=int, default=1000, help="Total number of frames per training iteration.")
     parser.add_argument("--stiff_iters", type=int, default=3, help="Total number of sampling stiffness iterations.")
-    parser.add_argument("--pose_iters", type=int, default=3, help="Total number of pose iterations.")
-    parser.add_argument("--object_name", type=str, default="", help="Name of the object to load.")
+    parser.add_argument("--pose_iters", type=int, default=10000, help="Total number of pose iterations.")
+    parser.add_argument("--object_name", type=str, default="006_mustard_bottle", help="Name of the object to load.")
     parser.add_argument("--object_density", type=float, default=2e0, help="Density of the object.")
     parser.add_argument("--verbose", action="store_true", help="Print out additional status messages during execution.")
     parser.add_argument("--no_init", action="store_true", help="Automatically initialize the fingers.")
@@ -610,9 +610,44 @@ if __name__ == "__main__":
     is_triangle = True
 
     with wp.ScopedDevice(args.device):
+        # --------------------------------------------------
+        # 1) OPTIONAL: optimise initial fingers on a circle
+        # --------------------------------------------------
         finger_transform = None
-        init_finger = None
+        init_finger_q = None
 
+        if not args.no_init:
+            print("Running InitializeFingers to optimise initial pose...")
+            init_finger = InitializeFingers(
+                stage_path="femtendon_sim.usd",     # or args.stage_path, doesn’t really matter here
+                finger_len=finger_len,
+                finger_rot=finger_rot,
+                finger_width=finger_width,
+                stop_margin=0.0005,
+                num_frames=30,                      # short optimisation horizon
+                iterations=args.pose_iters,         # how many gradient steps
+                scale=scale,
+                num_envs=1,
+                ycb_object_name=args.object_name,
+                object_rot=object_rot,
+                is_render=False,                    # no USD rendering during optimisation
+                verbose=args.verbose,
+                is_triangle=False,
+                finger_num=args.finger_num,
+                add_random=args.random,
+            )
+
+            finger_transform, init_finger_q = init_finger.get_initial_position()
+
+            # if optimisation fails, fall back gracefully
+            if finger_transform is None:
+                print("[WARN] InitializeFingers did not converge, falling back to default transforms.")
+                finger_transform = None
+        else:
+            init_finger = init_finger_q
+        # --------------------------------------------------
+        # 2) Build the full FEM tendon sim, using the initial pose
+        # --------------------------------------------------
         tendon = FEMTendon(
             stage_path=args.stage_path, 
             num_frames=args.num_frames, 
