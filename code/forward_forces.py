@@ -638,6 +638,30 @@ class FEMTendon:
         tip_traj = np.array(tip_traj)
 
         return tip_traj
+    
+    def set_stiffness(self, K: float):
+        """
+        Set a uniform stiffness K (bulk modulus, same meaning as builder.init_K)
+        for all tet blocks and update the material parameters.
+        """
+        logK = float(np.log(K))  # natural log, consistent with sample_logk
+
+        # create Warp array for per-block log(K)
+        self.log_K_warp = wp.from_numpy(
+            np.zeros(self.block_num, dtype=np.float32) + logK,
+            dtype=wp.float32,
+            requires_grad=self.requires_grad,
+        )
+
+        # push to tet_materials
+        wp.launch(
+            update_materials,
+            dim=len(self.model.tet_materials),
+            inputs=[self.log_K_warp, self.v, self.tet_block_ids],
+            outputs=[self.model.tet_materials],
+        )
+
+        
 
 
 if __name__ == "__main__":
@@ -689,103 +713,64 @@ if __name__ == "__main__":
         finger_transform = None
         init_finger = None
 
-        # choose forces to test
-        force_values = [25.0,50.0,75.0]
-        #force_values = [50.0]
-        trajectories = {}  # force -> (T, 3)
-        all_rows = []      # for CSV: list of [force, t, x, y, z]
-        sample_dt = {}   # force -> time step
+        force_values = [10.0, 20.0, 30.0]
+        stiffness_values = [5e5, 1e6, 2e6]
 
-        for F in force_values:
-            print(f"\n=== Running simulation with tendon force {F} ===")
+        trajectories = {}   # (F, K) -> (T, 3)
+        sample_dt = {}      # (F, K) -> dt
 
-            # new instance per force so initial state is clean
-            tendon = FEMTendon(
-                stage_path=args.stage_path,
-                num_frames=args.num_frames,
-                verbose=args.verbose,
-                save_log=False,
-                log_prefix=args.log_prefix,
-                is_render=args.is_render,              # no USD render needed for now
-                kernel_seed=np.random.randint(0, 10000),
-                train_iters=args.pose_iters,
-                object_rot=object_rot,
-                object_density=args.object_density,
-                ycb_object_name=args.object_name,
-                use_graph=args.use_graph,
-                finger_len=finger_len,
-                finger_rot=finger_rot,
-                finger_width=finger_width,
-                scale=scale,
-                finger_transform=finger_transform,
-                finger_num=args.finger_num,
-                quick_viz=args.quick_viz,
-                quick_viz_stride = args.quick_viz_stride,
-                quick_viz_interval=args.quick_viz_interval,
-                quick_viz_every=args.quick_viz_every,
-                quick_viz_save=args.quick_viz_save,
-                quick_viz_elev=args.quick_viz_elev,
-                quick_viz_azim=args.quick_viz_azim,
-                init_finger=init_finger)
+        for K in stiffness_values:
+            print(f"\n=== Using stiffness K = {K:.2e} ===")
+            for F in force_values:
+                print(f"   -> Running simulation with tendon force {F} N")
 
-            tendon.set_tendon_force(F)
-            tip_traj = tendon.run_and_record_tip(finger_index=0)  # (T,3)
-            trajectories[F] = tip_traj
-            # store time step for this run
-            sample_dt[F] = tendon.sim_dt
+                tendon = FEMTendon(
+                    stage_path=args.stage_path,
+                    num_frames=args.num_frames,
+                    verbose=args.verbose,
+                    save_log=False,
+                    log_prefix=args.log_prefix,
+                    is_render=args.is_render,
+                    kernel_seed=np.random.randint(0, 10000),
+                    train_iters=args.pose_iters,
+                    object_rot=object_rot,
+                    object_density=args.object_density,
+                    ycb_object_name=args.object_name,
+                    use_graph=args.use_graph,
+                    finger_len=finger_len,
+                    finger_rot=finger_rot,
+                    finger_width=finger_width,
+                    scale=scale,
+                    finger_transform=finger_transform,
+                    finger_num=args.finger_num,
+                    quick_viz=args.quick_viz,
+                    quick_viz_stride=args.quick_viz_stride,
+                    quick_viz_interval=args.quick_viz_interval,
+                    quick_viz_every=args.quick_viz_every,
+                    quick_viz_save=args.quick_viz_save,
+                    quick_viz_elev=args.quick_viz_elev,
+                    quick_viz_azim=args.quick_viz_azim,
+                    init_finger=init_finger,
+                )
 
+                tendon.set_stiffness(K)
+                tendon.set_tendon_force(F)
 
-        # ---------- Matplotlib plot (all forces, full trajectories) ----------
-        plt.figure(figsize=(8, 6))
+                tip_traj = tendon.run_and_record_tip(finger_index=0)  # (T, 3)
 
-        for F, traj in trajectories.items():
-            if traj.size == 0:
-                print(f"Skipping F={F} because trajectory is empty.")
-                continue
+                trajectories[(F, K)] = tip_traj
+                sample_dt[(F, K)] = tendon.sim_dt
 
-            # filter out NaNs/Infs if any
-            if traj.ndim != 2 or traj.shape[1] != 3:
-                print(f"Skipping F={F}: unexpected traj shape {traj.shape}")
-                continue
+                # just to confirm:
+                K_current = float(np.exp(tendon.log_K_warp.numpy()[0]))
+                print(f"Force {F} N used stiffness K = {K_current:.3e}")
 
-            mask = np.isfinite(traj).all(axis=1)
-            if not np.any(mask):
-                print(f"Skipping F={F}: no finite points.")
-                continue
-
-            # extract and reverse so that t=0 is at the "start" of the curve
-            x = traj[mask, 0][::-1]
-            y = traj[mask, 1][::-1]   # (x, y) plane
-
-            if x.size == 0:
-                print(f"Skipping F={F}: no valid samples after masking.")
-                continue
-
-            plt.plot(x, y, label=f"{F:.1f} N")
-
-        plt.xlabel("Tip X position")
-        plt.ylabel("Tip Y position")
-        plt.title("Fingertip trajectory for different tendon forces")
-        plt.grid(True)
-        plt.legend()
-
-        ax = plt.gca()
-        ax.set_aspect('equal', adjustable='box')
-        ax.invert_xaxis()   # flip X axis direction
-        #ax.invert_yaxis()   # flip Y axis direction  (optional)
-
-        out_path = "fingertip_trajectories.png"
-        plt.savefig(out_path, dpi=300, bbox_inches="tight")
-        print(f"Saved trajectory figure to {out_path}")
-        # plt.show()
-
-        # ---------- New: Y-position vs time ----------
+        # ---------- Y-position vs time ----------
         plt.figure(figsize=(8, 4))
 
-        for F, traj in trajectories.items():
+        for (F, K), traj in trajectories.items():
             if traj.size == 0:
                 continue
-
             if traj.ndim != 2 or traj.shape[1] != 3:
                 continue
 
@@ -793,14 +778,13 @@ if __name__ == "__main__":
             if not np.any(mask):
                 continue
 
-            # we want chronological order now → no [::-1] here
-            y = traj[mask, 1]   # y-coordinate
+            y = traj[mask, 1]
             n = y.size
+            dt = float(sample_dt[(F, K)])
+            t = np.arange(n) * dt
 
-            dt = float(sample_dt[F])
-            t = np.arange(n) * dt   # time in seconds
-
-            plt.plot(t, y, label=f"{F:.1f} N")
+            label = f"F={F:.1f} N, K={K:.2e}"
+            plt.plot(t, y, label=label)
 
         plt.xlabel("Time [s]")
         plt.ylabel("Tip Y position")
@@ -811,13 +795,14 @@ if __name__ == "__main__":
         out_path_y = "fingertip_y_vs_time.png"
         plt.savefig(out_path_y, dpi=300, bbox_inches="tight")
         print(f"Saved Y-vs-time figure to {out_path_y}")
-        # plt.show()
 
-        # ---------- New Plot: Final tip Y vs tendon force ----------
-        forces = []
-        final_y_positions = []
+        # ---------- Final tip Y vs tendon force (one curve per stiffness) ----------
+        from collections import defaultdict
 
-        for F, traj in trajectories.items():
+        forces_by_K = defaultdict(list)
+        final_y_by_K = defaultdict(list)
+
+        for (F, K), traj in trajectories.items():
             if traj.size == 0:
                 continue
 
@@ -826,39 +811,38 @@ if __name__ == "__main__":
                 continue
 
             traj_valid = traj[mask]
-
-            # final Y position (take last timestep)
             y_final = traj_valid[-1, 1]
 
-            forces.append(F)
-            final_y_positions.append(y_final)
+            forces_by_K[K].append(F)
+            final_y_by_K[K].append(y_final)
 
-        # sort by force for a clean plot
-        forces = np.array(forces)
-        final_y_positions = np.array(final_y_positions)
+        plt.figure(figsize=(6, 4))
 
-        sort_idx = np.argsort(forces)
-        forces = forces[sort_idx]
-        final_y_positions = final_y_positions[sort_idx]
+        for K, forces_list in forces_by_K.items():
+            forces_arr = np.array(forces_list)
+            y_arr = np.array(final_y_by_K[K])
 
-        plt.figure(figsize=(6,4))
-        plt.plot(forces, final_y_positions, "o-", lw=2)
+            # sort by force for a clean line
+            idx = np.argsort(forces_arr)
+            forces_arr = forces_arr[idx]
+            y_arr = y_arr[idx]
+
+            plt.plot(forces_arr, y_arr, "o-", lw=2, label=f"K={K:.2e}")
+
         plt.xlabel("Tendon force [N]")
         plt.ylabel("Final fingertip Y position")
-        plt.title("Final Y-position vs Tendon Force")
+        plt.title("Final Y-position vs Tendon Force (per stiffness)")
         plt.grid(True)
+        plt.legend()
 
         out_path_force = "final_y_vs_force.png"
         plt.savefig(out_path_force, dpi=300, bbox_inches="tight")
         print(f"Saved final-Y-vs-force plot to {out_path_force}")
 
-
-
-
         # optional: still allow quick_viz / render for the last run if you want
-        # (uncomment and reuse one of the tendon objects if needed)
         if args.is_render:
             tendon.render()
             tendon.renderer.save()
         if args.quick_viz:
             tendon.quick_visualize()
+
