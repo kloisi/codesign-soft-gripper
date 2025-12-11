@@ -63,6 +63,86 @@ def eval_triangles_contact(
     wp.atomic_add(f, j, fn * bary[1])
     wp.atomic_add(f, k, fn * bary[2])
 
+@wp.kernel
+def eval_triangles_contact_subset(
+    # counts
+    num_tris: int,
+    num_particles: int,
+    # arrays
+    x: wp.array(dtype=wp.vec3),
+    v: wp.array(dtype=wp.vec3),
+    tri_indices: wp.array2d(dtype=int), # (num_tris, 3)
+    tri_materials: wp.array2d(dtype=float), # (num_tris, 5): [ke, ka, kd, drag, lift]
+    particle_ids: wp.array(dtype=int), # (num_particles,)
+    particle_radius: wp.array(dtype=float),
+    contact_margin: float,
+    contact_ke: float,
+    contact_kd: float,
+    # contact_mu: float,
+    # out
+    f: wp.array(dtype=wp.vec3),
+):
+    
+    """ MW_ADDED """
+
+    tid = wp.tid()
+
+    tri_id = tid // num_particles
+    pid_local = tid % num_particles
+    if tri_id >= num_tris:
+        return
+
+    p_id = particle_ids[pid_local]
+
+    i = tri_indices[tri_id, 0]
+    j = tri_indices[tri_id, 1]
+    k = tri_indices[tri_id, 2]
+    if p_id == i or p_id == j or p_id == k:
+        return
+
+    px = x[p_id]
+    p  = x[i]; q = x[j]; r = x[k]
+    vi = v[i]; vj = v[j]; vk = v[k]
+
+    # closest point on finger triangle
+    bary = triangle_closest_point_barycentric(p, q, r, px)
+    closest = p * bary[0] + q * bary[1] + r * bary[2]
+
+    diff = px - closest
+    dist = wp.length(diff)
+    margin = contact_margin + particle_radius[p_id]
+    if dist >= margin: # no contacct
+        return
+
+    # else there is contact
+    
+    # triangle normal and direction
+    n = wp.normalize(wp.cross(q - p, r - p))
+    if wp.dot(n, diff) < 0.0:
+        n = -n
+
+    pen = margin - dist # penetration depth
+
+    # relative normal velocity
+    vs = vi * bary[0] + vj * bary[1] + vk * bary[2]
+    vn = wp.dot(n, v[p_id] - vs)
+
+    tri_ke = tri_materials[tri_id, 0]
+    tri_kd = tri_materials[tri_id, 2]
+
+    fn = contact_ke * pen # elastic part
+    fd = contact_kd * wp.min(vn, 0.0) # damping in compression only
+    # was:
+    # fn = tri_ke * pen # elastic
+    # fd = tri_kd * wp.min(vn, 0.0) # normal damping
+
+    f_total = n * (fn + fd) #total normal force
+
+    wp.atomic_sub(f, p_id, f_total)
+    wp.atomic_add(f, i,  f_total * bary[0])
+    wp.atomic_add(f, j,  f_total * bary[1])
+    wp.atomic_add(f, k,  f_total * bary[2])
+
 
 def eval_external_forces(model: Model, state: State, control: Control, particle_f: wp.array):
     if model.particle_count:
@@ -91,6 +171,46 @@ def eval_triangle_contact_forces(model: Model, state: State, particle_f: wp.arra
             outputs=[particle_f],
             device=model.device,
         )
+
+def eval_triangle_contact_finger_vs_cloth(model: Model, state: State, particle_f: wp.array):
+    """ MW_ADDED """
+    if model.enable_finger_cloth_collisions:
+        if (hasattr(model, "finger_tri_indices")
+            and hasattr(model, "finger_tri_materials")
+            and hasattr(model, "cloth_particle_ids")):
+
+            n_tris = model.finger_tri_indices.shape[0]
+            n_parts = model.cloth_particle_ids.shape[0]
+            if n_tris == 0 or n_parts == 0:
+                return
+
+            print_once = getattr(model, "_printed_subset_info", False)
+            if not print_once:
+                print("subset collision: n_tris =", n_tris, "n_parts =", n_parts)
+                model._printed_subset_info = True
+
+            wp.launch(
+                kernel=eval_triangles_contact_subset,
+                dim=n_tris * n_parts,
+                inputs=[
+                    n_tris,
+                    n_parts,
+                    state.particle_q,
+                    state.particle_qd,
+                    model.finger_tri_indices,
+                    model.finger_tri_materials,
+                    model.cloth_particle_ids,
+                    model.particle_radius,
+                    model.soft_contact_margin,   # reuse the existing margin
+                    # dedicated contact gains (start here, then tune)
+                    1.0e4, # contact_ke ###
+                    5.0e1, # contact_kd ###
+                    # (contact_mu if you add it) ###
+                ],
+                outputs=[particle_f],
+                device=model.device,
+            )
+
 
 @wp.kernel
 def eval_tetrahedra(
@@ -406,7 +526,7 @@ def additional_vels(
     target_vels: wp.array(dtype=wp.vec3),
     particle_v: wp.array(dtype=wp.vec3)):
     tid = wp.tid()
-    wp.atomic_add(particle_v, tid, target_vels[0])
+    wp.atomic_add(particle_v, tid, target_vels[0]) # particle_v[tid] += target_vels[0]
 
 def compute_additional_vels(model: Model, state: State, control: Control):
     wp.launch(
@@ -425,7 +545,9 @@ def compute_fem_forces(model: Model, state: State, control: Control, particle_f:
     eval_triangle_forces(model, state, control, particle_f)
 
     # triangle/triangle contacts
-    eval_triangle_contact_forces(model, state, particle_f)
+    # eval_triangle_contact_forces(model, state, particle_f)
+    if model.enable_finger_cloth_collisions:
+        eval_triangle_contact_finger_vs_cloth(model, state, particle_f)
 
     # triangle bending
     eval_bending_forces(model, state, particle_f)
@@ -470,6 +592,8 @@ class FEMIntegrator(SemiImplicitIntegrator):
 
             self.integrate_bodies(model, state_in, state_out, dt, self.angular_damping)
 
+            # v1 = v0 + (f0 * inv_mass + gravity * wp.step(-inv_mass)) * dt -> so a = f/m + g
+            # position update semi implicit since it uses new velocity: x1 = x0 + v1 * dt
             self.integrate_particles(model, state_in, state_out, dt)
 
             return state_out

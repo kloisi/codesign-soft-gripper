@@ -682,7 +682,8 @@ def load_object(builder, obj_loader,
     elif object == 'ycb':
         object_com, body_id, geo_id = obj_loader.add_ycb(builder, 
                     # np.array([0.1, 0.0, 0.03]) *self.scale, # side finger position
-                    np.array([0.0, 0.0, 0.0]) *s, # top finger position
+                    # np.array([0.0, 1.2, 0.0]) *s, # start mid-air above cloth
+                    np.array([0.0, 0.0, 0.0]) *s, # top finger position #### DEFAULT (On ground)
                     # wp.quat_rpy(-np.pi/2, 0.0, 0.0),
                     obj_rot,
                     obj_name=ycb_object_name,

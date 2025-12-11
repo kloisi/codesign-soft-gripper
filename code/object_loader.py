@@ -38,11 +38,15 @@ class ObjectLoader:
     def add_ycb(self, builder, 
                 pos: np.array, rot: wp.quat, 
                 scale: float, 
-                ke=1.0e6, kd=5.0e1, # default was ke=1.0e-5, kd=1.0e-1,
+                # contact stiffness 
+                ke=1.0e3, kd=1.0e1,
+                # stiffness test v4,5:    ke=1.0e3, kd=1.0e1,
+                # stiffness test v3:    ke=1.0e6, kd=5.0e1,
+                # default was           ke=1.0e-5, kd=1.0e-1,
                 kf=1e1, mu=1.0,
                 obj_name='006_mustard_bottle',
                 use_simple_mesh=False, is_fix=False,
-                density=1e1):
+                density=1e1): # density is set in parser arguments! noticed this on 05.12.2025
         # load a ycb object mesh file to the builder
         self.obj_name = obj_name
         # self.obj_name = '005_tomato_soup_can'

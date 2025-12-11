@@ -14,6 +14,8 @@ from init_pose import InitializeFingers
 from evaluation import Evaluation
 from scipy.spatial.transform import Rotation as R
 
+from quick_viz import quick_visualize
+
 @wp.kernel
 def update_materials(
     log_K: wp.array(dtype=wp.float32),
@@ -52,6 +54,8 @@ class FEMTendon:
     def __init__(self, 
                  stage_path="sim", num_frames=30, 
                  verbose=True, save_log=False,
+                 fps=5000,
+                 sim_substeps=100,
                  train_iters=1,
                  log_prefix="", 
                  is_render=True,
@@ -65,12 +69,13 @@ class FEMTendon:
                  is_ood=False):
         self.verbose = verbose
         self.save_log = save_log
-        fps = 5000
-        self.frame_dt = 1.0 / fps
+        self.fps = fps
+        self.frame_dt = 1.0 / fps # 0.0002 s, visual time per frame, the time between frames used for the USD / video timeline
         self.num_frames = num_frames
 
-        self.sim_substeps = 100
-        self.sim_dt = self.frame_dt / self.sim_substeps
+        self.sim_substeps = sim_substeps # how many integrator steps per visual frame
+        # If you want physical time and “render time” to match, you want: sim_substeps * sim_dt == frame_dt
+        self.sim_dt = self.frame_dt / self.sim_substeps # 0.0002 / 100 = 2e-6s, integration dt, actual physics timestep for each integrator step
         self.sim_time = 0.0
         self.render_time = 0.0
         self.iter = 0
@@ -117,11 +122,20 @@ class FEMTendon:
             obj_loader=self.obj_loader,
             finger_transform=self.finger_transform,
             is_triangle=True,
-            add_cloth=True, # add cloth
+            add_drop_cloth=True, # add cloth for dropping test
             cloth_res=(32, 32), # try different values
             )
         self.model = self.builder.model
         self.control = self.model.control(requires_grad=self.requires_grad)
+
+        # for quick viz of the YCB object, ADDED
+        self.obj_local_pts = None
+        if hasattr(self.obj_loader, "mesh"):
+            verts = np.asarray(self.obj_loader.mesh.vertices, dtype=np.float32)
+            verts = verts - verts.mean(axis=0, keepdims=True)   # same centering as shift_vs
+            verts = verts * self.scale                          # same scaling as Warp shape
+            verts = verts[::50]                                 # subsample for speed
+            self.obj_local_pts = verts
 
         self.tendon_holder = TendonHolder(self.model, self.control)
         self.integrator = FEMIntegrator()
@@ -198,6 +212,7 @@ class FEMTendon:
             np.zeros([1, 3]),
             dtype=wp.vec3, requires_grad=self.requires_grad)
         self.tendon_forces = wp.array([100.0]*self.finger_num, dtype=wp.float32, requires_grad=self.requires_grad)
+        # self.tendon_forces = wp.array([0.0]*self.finger_num, dtype=wp.float32, requires_grad=self.requires_grad) ### turn off tendon forces for cloth-ycb drop test
 
         self.tendon_holder.init_tendon_variables(requires_grad=self.requires_grad)
     
@@ -243,7 +258,7 @@ class FEMTendon:
 
                 self.object_body_f = self.states[index].body_f
 
-            if frame % 100 == 0:
+            if frame == 0 or frame % (self.num_frames / 5) == 0 or frame == (self.num_frames):
                 print(f"frame {frame} / {self.num_frames}: body_f:", self.object_body_f.numpy().flatten())
 
         self.object_q = self.states[-1].body_q
@@ -340,6 +355,51 @@ class FEMTendon:
                 self.renderer.end_frame()
                 self.render_time += self.frame_dt
     
+def print_mass_breakdown(tendon):
+    """ADDED"""
+
+    m_model = tendon.model
+    print("\nMASSES IN SCENE:")
+    # rigid body (YCB, coral, ...)
+    if m_model.body_count:
+        body_masses = m_model.body_mass.numpy()
+        for i, m in enumerate(body_masses):
+            print(f" body {i+1} mass: {m:.6f} kg")
+    else:
+        print("No rigid bodies in model.")
+
+    # particle masses (fingers + cloth)
+    inv_m = m_model.particle_inv_mass.numpy() # 1/mass
+    masses = np.zeros_like(inv_m)
+    mask = inv_m > 0.0
+    masses[mask] = 1.0 / inv_m[mask]
+
+    # print(f" Total particle mass (fingers + cloth): {masses.sum():.6f} kg")
+
+    # cloth mass
+    cloth_ids = getattr(tendon.builder, "drop_cloth_ids", None)
+    if cloth_ids is None and getattr(tendon.builder, "cloth_particle_ids", None) is not None:
+        cloth_ids = tendon.builder.cloth_particle_ids
+
+    if cloth_ids is not None:
+        cloth_mass = masses[cloth_ids].sum()
+        print(f" Cloth mass: {cloth_mass:.6f} kg")
+    else:
+        print(" No cloth ids found on builder.")
+
+    # finger mass (everything that is not cloth)
+    all_ids = np.arange(m_model.particle_count)
+    if cloth_ids is not None:
+        finger_ids = np.setdiff1d(all_ids, cloth_ids)
+    else:
+        finger_ids = all_ids
+
+    finger_mass = masses[finger_ids].sum()
+    print(f" Finger (soft body) mass: {finger_mass:.6f} kg\n")
+
+
+
+    
 if __name__ == "__main__":
     import argparse
 
@@ -362,7 +422,11 @@ if __name__ == "__main__":
     parser.add_argument("--log_prefix", type=str, default="", help="Prefix for the log file.")
     parser.add_argument("--pose_id", type=int, default=0, help="Initial pose id from anygrasp")
     parser.add_argument("--render", action="store_true", help="Render the simulation.")
-    
+
+    # ADDED
+    parser.add_argument("--fps", type=int, default=5000)
+    parser.add_argument("--sim_substeps", type=int, default=100)
+
     # experiment related setup
     parser.add_argument("--model_name", type=str, default="", help="Path to the model file.")
     parser.add_argument("--load_optim", action="store_true", help="Load the optimized stiffness.")
@@ -371,6 +435,15 @@ if __name__ == "__main__":
     parser.add_argument("--log_k", type=float, default=0.0, help="Log stiffness value.")
     parser.add_argument("--ood", action="store_true", help="Use out-of-distribution data.")
     parser.add_argument("--evaluation", action="store_true", help="Evaluate the simulation.")
+
+    # quick vizualization related args, ADDED
+    parser.add_argument("--quick_viz", action="store_true", help="Quick matplotlib cloth point cloud animation.")
+    parser.add_argument("--quick_viz_save", type=str, default=None, help="Optional mp4 save path, eg output/cloth.mp4")
+    parser.add_argument("--quick_viz_stride", type=int, default=50, help="Use every nth frame for quick viz.")
+    parser.add_argument("--quick_viz_interval", type=int, default=30, help="Milliseconds between frames.")
+    parser.add_argument("--quick_viz_every", type=int, default=1, help="Use every nth frame for quick viz.")
+    parser.add_argument("--quick_viz_elev", type=float, default=30, help="Camera elevation.")
+    parser.add_argument("--quick_viz_azim", type=float, default=80, help="Camera azimuth.") # roate the quick viz around y axis
 
     args = parser.parse_known_args()[0]
     np.set_printoptions(suppress=True)
@@ -499,6 +572,8 @@ if __name__ == "__main__":
             num_frames=args.num_frames, 
             verbose=args.verbose, 
             save_log=args.save_log,
+            fps=args.fps,
+            sim_substeps=args.sim_substeps,
             log_prefix=args.log_prefix,
             train_iters=args.train_iters,
             object_rot=object_rot,
@@ -515,11 +590,24 @@ if __name__ == "__main__":
             init_finger=init_finger,
             is_ood=args.ood,)
         
+        print_mass_breakdown(tendon)
+        
         if log_K is not None:
             tendon.log_K_warp = wp.from_numpy(log_K, dtype=wp.float32, requires_grad=True)
         
         for i in range(args.train_iters):
             tendon.simulate()
+
+        # ADDED
+        if args.quick_viz:
+            quick_visualize(
+                tendon,
+                stride=args.quick_viz_stride,
+                interval=args.quick_viz_interval,
+                save_path=args.quick_viz_save,
+                elev=args.quick_viz_elev,
+                azim=args.quick_viz_azim,
+            )
 
         if args.render:
             print("Rendering...")
