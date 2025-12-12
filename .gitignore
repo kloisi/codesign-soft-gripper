@@ -1,6 +1,11 @@
 #npz files for the start
 *.npz
 
+*.mp4
+*.csv
+*.png
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
