@@ -1,4 +1,3 @@
-#python code/render.py --object_name 006_mustard_bottle --random --pose_iters 1  --save_log
 import math
 import os
 import time
@@ -16,6 +15,69 @@ from object_loader import ObjectLoader
 from integrator_euler_fem import FEMIntegrator
 from tendon_model import TendonModelBuilder, TendonRenderer, TendonHolder
 from init_pose import InitializeFingers
+
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, FFMpegWriter
+from scipy.spatial.transform import Rotation as R
+
+def animate_point_clouds(point_clouds,
+                         interval=50,
+                         elev=30,
+                         azim=45,
+                         save_path=None,
+                         colors=None,
+                         axis_map="xyz",
+                         stride=1,
+                         show=True,
+                         point_size=5):
+    """
+    point_clouds: numpy array of shape (T, N, 3)
+    interval: ms between frames
+    save_path: if not None, saves mp4 (requires ffmpeg)
+    """
+    point_clouds = np.asarray(point_clouds)
+    # stride (skip frames)
+    pcs  = point_clouds[::stride]
+
+    T, N, D = pcs.shape
+
+    map_dict = {"x": 0, "y": 1, "z": 2}
+    order = [map_dict[c] for c in axis_map]
+    pcs = pcs[..., order]
+
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection="3d")
+
+    # limits
+    ax.set_xlim(pcs[..., 0].min(), pcs[..., 0].max())
+    ax.set_ylim(pcs[..., 1].min(), pcs[..., 1].max())
+    ax.set_zlim(pcs[..., 2].min(), pcs[..., 2].max())
+    ax.view_init(elev=elev, azim=azim)
+
+    # initial scatter
+    scat = ax.scatter(pcs[0, :, 0], pcs[0, :, 1], pcs[0, :, 2],
+                      s=point_size)
+    if colors is not None:
+        scat.set_color(colors)
+
+    def update(frame):
+        P = pcs[frame]
+        scat._offsets3d = (P[:, 0], P[:, 1], P[:, 2])
+        if colors is not None:
+            scat.set_color(colors)
+        return scat,
+
+    anim = FuncAnimation(fig, update, frames=T, interval=interval, blit=False)
+
+    if save_path is not None:
+        writer = FFMpegWriter(fps=max(1, 1000 // interval))
+        anim.save(save_path, writer=writer)
+        print("Saved quick viz to:", save_path)
+
+    if save_path is None and show:
+        plt.show()
+
+    return anim
 
 @wp.kernel
 def update_materials(
@@ -56,7 +118,7 @@ class FEMTendon:
     def __init__(self, 
                  stage_path="sim", num_frames=30, 
                  verbose=True, save_log=False,
-                 train_iters=1,
+                 train_iters=100,
                  log_prefix="", 
                  is_render=True,
                  use_graph=False,
@@ -66,6 +128,13 @@ class FEMTendon:
                  object_density=1e1,
                  finger_len=9, finger_rot=np.pi/9, finger_width=0.08, scale=4.0, finger_transform=None,
                  finger_num=2,
+                 quick_viz=False,
+                 quick_viz_stride = 1,
+                 quick_viz_interval=20,
+                 quick_viz_every=1,
+                 quick_viz_save=None,
+                 quick_viz_elev=30,
+                 quick_viz_azim=45,
                  init_finger=None):
         self.verbose = verbose
         self.save_log = save_log
@@ -92,6 +161,8 @@ class FEMTendon:
         self.obj_name = 'ycb'
         self.ycb_object_name = ycb_object_name
         self.object_density = object_density
+        self.has_object = bool(self.ycb_object_name)
+
 
         self.curr_dir = os.path.dirname(os.path.realpath(__file__))
         self.stage_path = self.curr_dir + "/../output/" + stage_path + f"{ycb_object_name}_{log_prefix}_frame{num_frames}" + ".usd"
@@ -123,6 +194,32 @@ class FEMTendon:
         self.model = self.builder.model
         self.control = self.model.control(requires_grad=self.requires_grad)
 
+        # for quick viz of the YCB object
+        self.obj_local_pts = None
+        if hasattr(self.obj_loader, "mesh"):
+            verts = np.asarray(self.obj_loader.mesh.vertices, dtype=np.float32)
+            verts = verts - verts.mean(axis=0, keepdims=True)   # same centering as shift_vs
+            verts = verts * self.scale                          # same scaling as Warp shape
+            verts = verts[::50]                                 # subsample for speed
+            self.obj_local_pts = verts
+
+        # quick viz settings
+        self.quick_viz = quick_viz
+        self.quick_viz_stride = quick_viz_stride
+        self.quick_viz_interval = quick_viz_interval
+        self.quick_viz_every = max(1, int(quick_viz_every))
+        self.quick_viz_save = quick_viz_save
+        self.quick_viz_elev = quick_viz_elev
+        self.quick_viz_azim = quick_viz_azim
+
+        # store cloth ids if present
+        self.cloth_ids = None
+        if hasattr(self.model, "cloth_particle_ids") and self.model.cloth_particle_ids is not None:
+            try:
+                self.cloth_ids = self.model.cloth_particle_ids.numpy()
+            except Exception:
+                self.cloth_ids = None
+
         self.tendon_holder = TendonHolder(self.model, self.control)
         self.integrator = FEMIntegrator()
 
@@ -137,9 +234,14 @@ class FEMTendon:
         for i in range(self.sim_substeps * self.num_frames + 1):
             self.states.append(self.model.state(requires_grad=self.requires_grad))
         self.init_particle_q = self.states[0].particle_q.numpy()[0, :]
-        self.init_body_q = self.states[0].body_q.numpy()[0, :]
-        self.object_body_f = self.states[0].body_f
-        self.object_q = self.states[0].body_q
+        if self.has_object:
+            self.init_body_q = self.states[0].body_q.numpy()[0, :]
+            self.object_body_f = self.states[0].body_f
+            self.object_q = self.states[0].body_q
+        else:
+            self.init_body_q = None
+            self.object_body_f = None
+            self.object_q = None
         self.object_grav = np.zeros(6)
         self.log_K_list = []
         self.save_list = []
@@ -207,7 +309,13 @@ class FEMTendon:
         self.all_ids = wp.array(np.arange(len(self.model.particle_q)), dtype=wp.int32, requires_grad=False)
 
         # self.log_K_warp = wp.from_numpy(np.zeros(len(self.model.tet_materials)) + np.log(self.builder.init_K), dtype=wp.float32, requires_grad=self.requires_grad)
-        self.log_K_warp = wp.from_numpy(np.zeros(self.block_num) + np.log(13.5), dtype=wp.float32, requires_grad=self.requires_grad)
+        K0 = self.builder.init_K  # e.g. 2.0e6 from add_finger
+        self.log_K_warp = wp.from_numpy(
+            np.zeros(self.block_num) + np.log(K0),
+            dtype=wp.float32,
+            requires_grad=self.requires_grad,
+        )
+
         self.v = wp.array([self.builder.init_v], dtype=wp.float32, requires_grad=self.requires_grad)
 
         wp.launch(update_materials,
@@ -249,6 +357,15 @@ class FEMTendon:
                 inputs=[self.kernel_seed + self.iter, 13.5, 17.0],
                 outputs=[self.log_K_warp])
         print(f"iter:{self.iter}, sampled log_K:", self.log_K_warp.numpy()[:10])
+
+        if not getattr(self, "has_object", True):
+            if self.use_cuda_graph:
+                wp.capture_launch(self.graph)
+            else:
+                self.forward()
+            self.sim_time += self.frame_dt
+            self.iter += 1
+            return
 
         # sample density
         new_density = np.random.uniform(1e0, 1e1)
@@ -349,6 +466,103 @@ class FEMTendon:
                     force_scale=0.1)
                 self.renderer.end_frame()
                 self.render_time += self.frame_dt
+
+    def quick_visualize(self):
+        if not getattr(self, "quick_viz", False):
+            print("quick_viz is off")
+            return
+
+        pcs = []
+
+        # total particles
+        P_total = self.model.particle_count
+        all_ids = np.arange(P_total, dtype=np.int32)
+
+        # ---- optional cloth handling ----
+        cloth_ids = None
+        if hasattr(self.model, "cloth_particle_ids") and self.model.cloth_particle_ids is not None:
+            try:
+                cloth_ids = self.model.cloth_particle_ids.numpy().astype(np.int32)
+            except Exception:
+                cloth_ids = None
+
+        # everything not cloth = fingers / soft body
+        if cloth_ids is not None:
+            finger_ids = np.setdiff1d(all_ids, cloth_ids)
+        else:
+            finger_ids = all_ids
+
+        # optional YCB object points
+        obj_local = getattr(self, "obj_local_pts", None)
+        n_obj = 0 if obj_local is None else len(obj_local)
+
+        # colors
+        finger_color = np.array([0.2, 0.8, 0.2])  # green
+        cloth_color  = np.array([0.9, 0.4, 0.1])  # orange
+        obj_color    = np.array([0.2, 0.3, 1.0])  # blue
+
+        n_f = len(finger_ids)
+        n_c = 0 if cloth_ids is None else len(cloth_ids)
+        N = n_f + n_c + n_obj
+
+        colors = np.zeros((N, 3), dtype=np.float32)
+        colors[:n_f] = finger_color
+        if n_c > 0:
+            colors[n_f:n_f+n_c] = cloth_color
+        if n_obj > 0:
+            colors[n_f+n_c:] = obj_color
+
+        # stride over frames
+        stride_frames = getattr(self, "quick_viz_stride", 20)
+
+        for f in range(0, self.num_frames + 1, stride_frames):
+            state = self.states[f * self.sim_substeps]
+
+            q = state.particle_q.numpy()
+            if q.ndim == 3:
+                q = q[0]  # (P,3)
+
+            P_finger = q[finger_ids]
+            P_list = [P_finger]
+
+            if cloth_ids is not None:
+                P_cloth = q[cloth_ids]
+                P_list.append(P_cloth)
+
+            # add object samples if we have them
+            if obj_local is not None:
+                bq = state.body_q.numpy()
+                if bq.ndim == 3:
+                    bq = bq[0]
+                pos = bq[0, :3]
+                quat = bq[0, 3:7]  # xyzw
+
+                rotm = R.from_quat(quat).as_matrix()
+                obj_world = (obj_local @ rotm.T) + pos
+                P_list.append(obj_world.astype(np.float32))
+
+            P = np.vstack(P_list)       # all 2D now
+            pcs.append(P.astype(np.float32))
+
+        pcs = np.stack(pcs, axis=0)  # (T,N,3)
+
+        save_path = getattr(self, "quick_viz_save", None)
+        show = getattr(self, "quick_viz_show", save_path is None)
+
+        anim = animate_point_clouds(
+            pcs,
+            interval=getattr(self, "quick_viz_interval", 30),
+            elev=getattr(self, "quick_viz_elev", 25),
+            azim=getattr(self, "quick_viz_azim", 45),
+            save_path=save_path,
+            colors=colors,
+            axis_map="xzy",   # so gravity is vertical
+            stride=1,         # temporal stride already applied
+            show=show,
+            point_size=getattr(self, "quick_viz_point_size", 6),
+        )
+        return anim
+
     
 if __name__ == "__main__":
     import argparse
@@ -361,9 +575,9 @@ if __name__ == "__main__":
         default="sim",
         help="Path to the output USD file.",
     )
-    parser.add_argument("--num_frames", type=int, default=1, help="Total number of frames per training iteration.")
-    parser.add_argument("--stiff_iters", type=int, default=1, help="Total number of sampling stiffness iterations.")
-    parser.add_argument("--pose_iters", type=int, default=1, help="Total number of pose iterations.")
+    parser.add_argument("--num_frames", type=int, default=1000, help="Total number of frames per training iteration.")
+    parser.add_argument("--stiff_iters", type=int, default=3, help="Total number of sampling stiffness iterations.")
+    parser.add_argument("--pose_iters", type=int, default=10000, help="Total number of pose iterations.")
     parser.add_argument("--object_name", type=str, default="006_mustard_bottle", help="Name of the object to load.")
     parser.add_argument("--object_density", type=float, default=2e0, help="Density of the object.")
     parser.add_argument("--verbose", action="store_true", help="Print out additional status messages during execution.")
@@ -374,6 +588,17 @@ if __name__ == "__main__":
     parser.add_argument("--pose_id", type=int, default=0, help="Initial pose id from anygrasp")
     parser.add_argument("--random", action="store_true", help="Add random noise to the initial position.")
     parser.add_argument("--finger_num", type=int, default=2, help="Number of fingers.")
+    parser.add_argument("--is_render", action="store_true", help="Enable USD rendering.")
+
+    # quick vizualization related args
+    parser.add_argument("--quick_viz", action="store_true", help="Quick matplotlib cloth point cloud animation.")
+    parser.add_argument("--quick_viz_save", type=str, default=None, help="Optional mp4 save path, eg output/cloth.mp4")
+    parser.add_argument("--quick_viz_stride", type=int, default=20, help="Use every nth frame for quick viz.")
+    parser.add_argument("--quick_viz_interval", type=int, default=20, help="Milliseconds between frames.")
+    parser.add_argument("--quick_viz_every", type=int, default=1, help="Use every nth frame for quick viz.")
+    parser.add_argument("--quick_viz_elev", type=float, default=30, help="Camera elevation.")
+    parser.add_argument("--quick_viz_azim", type=float, default=45, help="Camera azimuth.")
+
 
     args = parser.parse_known_args()[0]
 
@@ -385,31 +610,51 @@ if __name__ == "__main__":
     is_triangle = True
 
     with wp.ScopedDevice(args.device):
+        # --------------------------------------------------
+        # 1) OPTIONAL: optimise initial fingers on a circle
+        # --------------------------------------------------
         finger_transform = None
-        init_finger = InitializeFingers( 
-                            finger_len=finger_len, 
-                            finger_rot=finger_rot,
-                            finger_width=finger_width,
-                            stop_margin=0.0005,
-                            scale=scale,
-                            num_envs=1,
-                            ycb_object_name=args.object_name,
-                            object_rot=object_rot,
-                            num_frames=30, 
-                            iterations=1,
-                            is_render=False,
-                            is_triangle=is_triangle,
-                            pose_id=args.pose_id,
-                            finger_num=args.finger_num,
-                            add_random=args.random,)
-            
+        init_finger_q = None
+
+        if not args.no_init:
+            print("Running InitializeFingers to optimise initial pose...")
+            init_finger = InitializeFingers(
+                stage_path="femtendon_sim.usd",     # or args.stage_path, doesn’t really matter here
+                finger_len=finger_len,
+                finger_rot=finger_rot,
+                finger_width=finger_width,
+                stop_margin=0.0005,
+                num_frames=30,                      # short optimisation horizon
+                iterations=args.pose_iters,         # how many gradient steps
+                scale=scale,
+                num_envs=1,
+                ycb_object_name=args.object_name,
+                object_rot=object_rot,
+                is_render=False,                    # no USD rendering during optimisation
+                verbose=args.verbose,
+                is_triangle=False,
+                finger_num=args.finger_num,
+                add_random=args.random,
+            )
+
+            finger_transform, init_finger_q = init_finger.get_initial_position()
+
+            # if optimisation fails, fall back gracefully
+            if finger_transform is None:
+                print("[WARN] InitializeFingers did not converge, falling back to default transforms.")
+                finger_transform = None
+        else:
+            init_finger = init_finger_q
+        # --------------------------------------------------
+        # 2) Build the full FEM tendon sim, using the initial pose
+        # --------------------------------------------------
         tendon = FEMTendon(
             stage_path=args.stage_path, 
             num_frames=args.num_frames, 
             verbose=args.verbose, 
             save_log=args.save_log,
             log_prefix=args.log_prefix,
-            is_render=True,
+            is_render=args.is_render,
             kernel_seed=np.random.randint(0, 10000),
             train_iters=args.pose_iters,
             object_rot=object_rot,
@@ -422,23 +667,23 @@ if __name__ == "__main__":
             scale=scale,
             finger_transform=finger_transform,
             finger_num=args.finger_num,
+            quick_viz=args.quick_viz,
+            quick_viz_stride = args.quick_viz_stride,
+            quick_viz_interval=args.quick_viz_interval,
+            quick_viz_every=args.quick_viz_every,
+            quick_viz_save=args.quick_viz_save,
+            quick_viz_elev=args.quick_viz_elev,
+            quick_viz_azim=args.quick_viz_azim,
             init_finger=init_finger)
 
-        for i in range(args.pose_iters):
-            init_finger.load_grasp_pose(-1)
-            init_finger.reset_states()
-            finger_transform, jq = init_finger.get_initial_position()
-            if finger_transform is None or jq is None:
-                print("Failed to initialize fingers.")
-                continue
 
-            tendon.finger_transform = finger_transform
-            tendon.reset_states(init_finger.curr_finger_mesh)
-            for j in range(args.stiff_iters):
-                tendon.simulate()
-            tendon.save_data()
 
-        tendon.render()
-        tendon.renderer.save()
+        tendon.forward()
+        if args.is_render:
+            tendon.render()
+            tendon.renderer.save()
+        if args.quick_viz:
+            tendon.quick_visualize()
+        
 
 
