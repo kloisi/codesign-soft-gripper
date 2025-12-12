@@ -413,7 +413,8 @@ def multi_transform_to11d(trans: wp.array(dtype=wp.float32), # 9d
         transform_9d[offset_9d + i + 3] = R[i // 3, i % 3]
         
     # prismatic joint
-    for i in range(2):
+    N = transform_2d.shape[0]
+    for i in range(N):
         transform_2d[offset_2d + i] = trans[env_offset + i + 7]
 
 @wp.kernel
@@ -455,7 +456,8 @@ def multi_transform_from11d(transform_9d: wp.array(dtype=float),
     q = wp.transform_get_rotation(T)
     for i in range(4):
         trans[env_offset + i + 3] = q[i]
-    for i in range(2):
+    N = transform_2d.shape[0]
+    for i in range(N):
         trans[env_offset + i + 7] = transform_2d[offset_2d + i]
         
 @wp.func
@@ -564,7 +566,8 @@ def transform_from11d(transform_9d: wp.array(dtype=float),
     q = wp.transform_get_rotation(T)
     for i in range(4):
         trans[i + 3] = q[i]
-    for i in range(2):
+    N = transform_2d.shape[0]
+    for i in range(N):
         trans[i + 7] = transform_2d[i]
 
 @wp.kernel
@@ -582,7 +585,8 @@ def transform_to11d(trans: wp.array(dtype=wp.float32), # 9d
         transform_9d[i + 3] = R[i // 3, i % 3]
         
     # prismatic joint
-    for i in range(2):
+    N = transform_2d.shape[0] 
+    for i in range(N):
         transform_2d[i] = trans[i + 7]
         
 
@@ -663,6 +667,8 @@ def load_object(builder, obj_loader,
                  density=1e1,
                  use_simple_mesh=True,
                  is_fix=False):
+    if not ycb_object_name:
+        return
     s = scale
     object_com = None
     if object == 'box':
@@ -682,7 +688,8 @@ def load_object(builder, obj_loader,
     elif object == 'ycb':
         object_com, body_id, geo_id = obj_loader.add_ycb(builder, 
                     # np.array([0.1, 0.0, 0.03]) *self.scale, # side finger position
-                    np.array([0.0, 0.0, 0.0]) *s, # top finger position
+                    # np.array([0.0, 1.2, 0.0]) *s, # start mid-air above cloth
+                    np.array([0.0, 0.0, 0.0]) *s, # top finger position #### DEFAULT (On ground)
                     # wp.quat_rpy(-np.pi/2, 0.0, 0.0),
                     obj_rot,
                     obj_name=ycb_object_name,
