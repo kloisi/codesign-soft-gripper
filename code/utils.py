@@ -566,7 +566,8 @@ def transform_from11d(transform_9d: wp.array(dtype=float),
     q = wp.transform_get_rotation(T)
     for i in range(4):
         trans[i + 3] = q[i]
-    for i in range(2):
+    N = transform_2d.shape[0]
+    for i in range(N):
         trans[i + 7] = transform_2d[i]
 
 @wp.kernel
@@ -584,7 +585,8 @@ def transform_to11d(trans: wp.array(dtype=wp.float32), # 9d
         transform_9d[i + 3] = R[i // 3, i % 3]
         
     # prismatic joint
-    for i in range(2):
+    N = transform_2d.shape[0] 
+    for i in range(N):
         transform_2d[i] = trans[i + 7]
         
 

@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import torch
+import math
 
 import warp as wp
 import utils
@@ -262,7 +263,7 @@ class InitializeFingers:
         self.builder.add_joint_free(parent=-1, child=wrist_body)
 
         # contact/thickness-based limits (same for all prismatic joints for now)
-        limit_low, limit_upp = 1 * finger_THK, 6 * finger_THK
+        limit_low, limit_upp = 0.0 , 6 * finger_THK
         self.limit_low, self.limit_upp = limit_low, limit_upp
 
         # add collision shapes for each finger
@@ -279,13 +280,16 @@ class InitializeFingers:
             )
             self.finger_shape_ids.append(finger_shape_id)
 
-        # add prismatic joints for all fingers (x-axis). You can customize axes/limits per finger later.
+        # prismatic joints with **radial** axis per finger
         self.prismatic_ids = []
         for i in range(self.finger_num):
+            theta = 2.0 * math.pi * i / self.finger_num
+            # radial direction in xz plane
+            axis = wp.vec3(-math.cos(theta), 0.0, -math.sin(theta))
             jid = self.builder.add_joint_prismatic(
                 parent=wrist_body,
                 child=self.finger_body_idx[i],
-                axis=wp.vec3(1.0, 0.0, 0.0),
+                axis=axis,
                 limit_lower=-limit_upp,
                 limit_upper= limit_upp,
             )
@@ -293,10 +297,41 @@ class InitializeFingers:
 
         # finalize and load initial pose
         self.model = self.builder.finalize(requires_grad=True)
-        self.load_grasp_pose(self.pose_id)  # make sure this now sets 7 + finger_num DOFs
+        self.init_circle_pose()
+        #self.load_grasp_pose(self.pose_id)  # make sure this now sets 7 + finger_num DOFs
 
         # collision margin
         self.model.object_contact_margin = self.stop_margin * self.scale
+
+    def init_circle_pose(self):
+        # --- get object position from the model state ---
+        # create a temporary state to read initial body poses
+        tmp_state = self.model.state()
+        bq = tmp_state.body_q.numpy()[self.obj_body_id]  # shape (7,) -> [x,y,z,qx,qy,qz,qw]
+        t_gb = bq[0:3].astype(np.float32)
+
+        # lift wrist a bit in +y if you like
+        t_gb[1] += self.init_height_offset
+
+        # simple orientation (identity)
+        # adjust if you want the “open side” to face +x, etc.
+        R_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)  # x,y,z,w
+
+        # initial radius (inside joint limits)
+        R0 = 0.2 * self.limit_upp  # e.g. 20% of max extension
+        finger_init = [R0] * self.finger_num  # all same radius to start
+
+        self.model.joint_q = wp.array(
+            t_gb.tolist() + R_quat.tolist() + finger_init,
+            dtype=wp.float32,
+            requires_grad=True,
+        )
+
+        # if you really want, you can also bias left/right:
+        # for i in range(self.finger_num):
+        #     sign = 1.0  # or -1.0 for some fingers
+        #     finger_init[i] = sign * R0
+
 
     def load_grasp_pose(self, pose_id):
         self.pose_id = pose_id
@@ -410,12 +445,20 @@ class InitializeFingers:
         self.optimizer.step(closure)
         with torch.no_grad():
             for i in range(self.finger_num):
-                if i < self.finger_num // 2:
-                    # “left side” − fingers should be negative
-                    self.transform_2d[i].clamp_(-self.limit_upp, -self.limit_low)
-                else:
-                    # “right side” − fingers should be positive
-                    self.transform_2d[i].clamp_(self.limit_low, self.limit_upp)
+                self.transform_2d.clamp_(self.limit_low, self.limit_upp)
+                # if i < self.finger_num // 2:
+                #     # “left side” − fingers should be negative
+                #     self.transform_2d[i].clamp_(-self.limit_upp, -self.limit_low)
+                # else:
+                #     # “right side” − fingers should be positive
+                #     self.transform_2d[i].clamp_(self.limit_low, self.limit_upp)
+            # --- NEW: log current radius parameters ---
+            current_radius = self.transform_2d.detach().cpu().numpy().copy()
+
+
+            # print every e.g. 100 iters
+            if iter % 10 == 0:
+                print(f"[iter {iter}] radius params (transform_2d): {current_radius}")
 
         if iter % 1000 == 0:
             print("iter:", iter, "loss:", self.loss)
