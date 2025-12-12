@@ -1,5 +1,8 @@
 #npz files for the start
 *.npz
+*.png
+*.mp4
+*.csv
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
