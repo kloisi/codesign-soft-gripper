@@ -122,8 +122,8 @@ class FEMTendon:
             obj_loader=self.obj_loader,
             finger_transform=self.finger_transform,
             is_triangle=True,
-            add_drop_cloth=True, # add cloth for dropping test
-            cloth_res=(32, 32), # try different values
+            add_connecting_cloth=True,
+            add_drop_cloth=False, # add cloth for dropping test
             )
         self.model = self.builder.model
         self.control = self.model.control(requires_grad=self.requires_grad)
@@ -134,7 +134,7 @@ class FEMTendon:
             verts = np.asarray(self.obj_loader.mesh.vertices, dtype=np.float32)
             verts = verts - verts.mean(axis=0, keepdims=True)   # same centering as shift_vs
             verts = verts * self.scale                          # same scaling as Warp shape
-            verts = verts[::50]                                 # subsample for speed
+            verts = verts[::10]                                 # subsample for speed
             self.obj_local_pts = verts
 
         self.tendon_holder = TendonHolder(self.model, self.control)
@@ -411,7 +411,7 @@ if __name__ == "__main__":
         default="femtendon_sim.usd",
         help="Path to the output USD file.",
     )
-    parser.add_argument("--num_frames", type=int, default=5000, help="Total number of frames per training iteration.") # changed number of frames to give enough time for the cloth to fall and deform
+    parser.add_argument("--num_frames", type=int, default=100, help="Total number of frames per training iteration.") # changed number of frames to give enough time for the cloth to fall and deform
     parser.add_argument("--train_iters", type=int, default=1, help="Total number of training iterations.")
     parser.add_argument("--object_name", type=str, default="006_mustard_bottle", help="Name of the object to load.")
     parser.add_argument("--object_density", type=float, default=2e0, help="Density of the object.")

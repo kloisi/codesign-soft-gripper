@@ -338,7 +338,6 @@ class TendonModelBuilder(ModelBuilder):
         self.cloth_particle_ids = None # final union off all cloth particles, for cloth-finger collision
 
         # mainly to color attachment points in the viz
-        self.finger_attach_ids       = [] # list of lists, per finger
         self.attached_cloth_ids      = [] # list of np arrays, one per attached cloth patch
         self.attached_cloth_edge_ids = [] # list of lists, edge vertices of cloth that we attach to fingers
 
@@ -468,7 +467,12 @@ class TendonModelBuilder(ModelBuilder):
         self.finger_back_ids_per_finger = [[] for _ in range(finger_num)]
         # for cloth-finger attachment
         self.finger_particle_ids = [[] for _ in range(finger_num)]
-        self.finger_attach_ids = [[] for _ in range(finger_num)]
+
+        # combined list for viz
+        self.finger_attach_ids = [[] for _ in range(finger_num)] # list of lists, per finger
+        # per-edge lists for attachment
+        self.finger_left_attach_ids  = [[] for _ in range(finger_num)]
+        self.finger_right_attach_ids = [[] for _ in range(finger_num)]
 
     def build_fem_model(self, 
                         finger_width=0.06, finger_rot=0.3,
@@ -476,8 +480,8 @@ class TendonModelBuilder(ModelBuilder):
                         obj_loader=None, 
                         finger_transform=None,
                         is_triangle=False,
-                        add_drop_cloth=False, ###
-                        cloth_res=(32, 32)): ###
+                        add_connecting_cloth=False, #cloth that connects fingers
+                        add_drop_cloth=False): # cloth for drop behavior tests
         s = self.scale
         self.finger_transform = finger_transform
 
@@ -526,59 +530,41 @@ class TendonModelBuilder(ModelBuilder):
         #########################################################
         # add cloth grids, MW_ADDED
         #########################################################
+
+        # --- Cloth dropping onto the scene for behavior test ---
         if add_drop_cloth:
-            # --- cloth for dropping tests ---
-
-            cloth_dim_x, cloth_dim_y = cloth_res # cloth grid resolution
-            cloth_cell = 0.01 * s # base cell size, scaled with s
-
-            Lx = cloth_dim_x * cloth_cell
-            Ly = cloth_dim_y * cloth_cell
-
-            # approximate vertical placement, make sure the cloth starts over the fingers/ YCB Object:
-            # make sure the cloth starts over the fingers/ YCB Object:
-            mid_h = 0.0
-            if obj_loader is not None and hasattr(obj_loader, "mid_height"):
-                mid_h = float(obj_loader.mid_height)
-
-            object_top = 2.0 * mid_h # Top of YCB object is 2 * mid_height
-
-            cloth_y = object_top + 0.1 * s  # margin above object,
-            # cloth_y = object_top + 0.5 * s  # further above fingers for cloth - ycb fall test
-            # cloth_y = mid_h + finger_height + 0.05 * s
-
-            cloth_pos = wp.vec3(-0.5 * Lx, cloth_y, -0.5 * Ly) # center of cloth in center above YCB Object
-
-            p_start = len(self.particle_q) # save cloth particle ids to enable cloth-finger collision
-
-            cloth_scale = 0.01 # 0.01
-
-            self.add_cloth_grid(
-                pos=cloth_pos,
-                rot=wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), math.pi * 0.5), # grid in x-z plane
-                vel=wp.vec3(0.0, 0.0, 0.0),
-                dim_x=cloth_dim_x,
-                dim_y=cloth_dim_y,
-                cell_x=cloth_cell,
-                cell_y=cloth_cell,
-                mass=0.05 * cloth_scale, # mass per vertex, 33x33x0.05 = 54.45 kg cloth???? v1 to v6: 0.05
-                fix_left=False, # set False for fully free falling cloth
-                fix_right=False,
-                # internal cloth stiffness params, does not affect cloth-object interaction stiffness
-                tri_ke=1.0e3 * cloth_scale, # elastic stiffness, was 1.0e3, v5: 2.0e2, v6: 1.0e2, in-plane stretch/shear stiffness of triangles. ###
-                tri_ka=1.0e3 * cloth_scale, # area stiffness, was 1.0e3, v5: 2.0e2, v6: 1.0e2, area preservation (resists becoming too squashed/expanded) ###
-                tri_kd=1.0e1 * cloth_scale, # damping, was 1.0e1, v5: 5.0e1, v6: 1.0e2, internal damping of the cloth, controlling how much it wiggles after being disturbed ###
+            self.add_drop_cloth_grid(
+                obj_loader=obj_loader,
+                cloth_res=(32, 32)
             )
-            
-            p_end = len(self.particle_q) # save cloth particle ids to enable cloth-finger collision
-            self.drop_cloth_ids = np.arange(p_start, p_end, dtype=np.int32) # capture the new particle ids, separate variable for the attached cloth
+
+        # --- Cloth connecting between fingers ---
+        # build welded membrane between the *edges* of the two fingers
+        # here: right edge of finger 0 -> left edge of finger 1
+        if add_connecting_cloth:
+            for i in range(self.finger_num):
+                j = (i + 1) % self.finger_num
+                self.add_connecting_cloth(
+                    finger_a=i,
+                    finger_b=j,
+                    edge_a="right",
+                    edge_b="left",
+                    dx_nominal=cell_size[0],
+                    mass_per_vertex=1e-3,
+                    tri_ke=1.0e2,
+                    tri_ka=1.0e2,
+                    tri_kd=1.0e1,
+                )
 
 
-        # --- Merge all cloth particles into one list for cloth-finger collisions ---
+        # --- Merge all cloth particles into one list for cloth-finger collisions / viz ---
         all_cloth_ids = []
         # drop cloth (if any)
         if getattr(self, "drop_cloth_ids", None) is not None:
             all_cloth_ids.append(self.drop_cloth_ids)
+        # attached cloth strips (interior vertices of connecting patches)
+        if self.attached_cloth_ids:
+            all_cloth_ids.extend(self.attached_cloth_ids)
         if all_cloth_ids:
             # union of all cloth particles, no duplicates
             self.cloth_particle_ids = np.unique(
@@ -586,6 +572,7 @@ class TendonModelBuilder(ModelBuilder):
             ).astype(np.int32)
         else:
             self.cloth_particle_ids = None
+        
 
         # finalize model (now includes fingers, cloth, YCB object)
         self.model = self.finalize(requires_grad=self.requires_grad)
@@ -755,12 +742,28 @@ class TendonModelBuilder(ModelBuilder):
         self.finger_particle_ids[index] = list(range(particle_start_idx, particle_end_idx))
 
         # Choose attachment nodes in local finger coords, before transform
-        attach_ids = self.select_cloth_finger_attachment_ids(
+        # We split into the two edges, then store both and also a combined list.
+
+        num_attach_per_edge = 18
+
+        edge_lo_ids = self.select_cloth_finger_attachment_ids(
             finger_index=index,
-            which="spine",
-            num_attach=18,
+            which="edge_lo",
+            num_attach=num_attach_per_edge,
         )
-        self.finger_attach_ids[index] = attach_ids # store them here
+        edge_hi_ids = self.select_cloth_finger_attachment_ids(
+            finger_index=index,
+            which="edge_hi",
+            num_attach=num_attach_per_edge,
+        )
+
+        # Store per-edge for connecting cloth
+        # (Interpretation: we will later call one "left", one "right")
+        self.finger_left_attach_ids[index]  = edge_lo_ids
+        self.finger_right_attach_ids[index] = edge_hi_ids
+
+        # Combined list kept for viz/backwards compatibility
+        self.finger_attach_ids[index] = edge_lo_ids + edge_hi_ids
 
 
         self.find_waypoints_tri_indices(index)
@@ -805,6 +808,247 @@ class TendonModelBuilder(ModelBuilder):
         finger_mats = np.array(self.tri_materials[tri_start:tri_end], dtype=np.float32)
         self.finger_tri_indices_list.append(finger_tris)
         self.finger_tri_mats_list.append(finger_mats)
+
+
+
+    def add_drop_cloth_grid(
+        self,
+        obj_loader=None,
+        cloth_res=(32, 32),
+    ):
+        """
+        MW_ADDED
+
+        Create free-falling cloth for cloth–object behavior tests.
+        - Generates rectangular cloth grid using add_cloth_grid().
+        - Places it above the YCB object (if obj_loader is given) or above origin.
+        - Stores particle indices in self.drop_cloth_ids.
+        """
+
+        s = self.scale
+
+        cloth_dim_x, cloth_dim_y = cloth_res # cloth grid resolution
+        cloth_cell = 0.01 * s # base cell size, scaled with s
+
+        Lx = cloth_dim_x * cloth_cell
+        Ly = cloth_dim_y * cloth_cell
+
+        # approximate vertical placement, make sure the cloth starts over the fingers/ YCB Object:
+        # make sure the cloth starts over the fingers/ YCB Object:
+        mid_h = 0.0
+        if obj_loader is not None and hasattr(obj_loader, "mid_height"):
+            mid_h = float(obj_loader.mid_height)
+
+        object_top = 2.0 * mid_h # Top of YCB object is 2 * mid_height
+
+        cloth_y = object_top + 0.1 * s  # margin above object,
+        # cloth_y = object_top + 0.5 * s  # further above fingers for cloth - ycb fall test
+        # cloth_y = mid_h + finger_height + 0.05 * s
+
+        cloth_pos = wp.vec3(-0.5 * Lx, cloth_y, -0.5 * Ly) # center of cloth in center above YCB Object
+
+        p_start = len(self.particle_q) # save cloth particle ids to enable cloth-finger collision
+
+        cloth_scale = 0.01 # 0.01
+
+        self.add_cloth_grid(
+            pos=cloth_pos,
+            rot=wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), math.pi * 0.5), # grid in x-z plane
+            vel=wp.vec3(0.0, 0.0, 0.0),
+            dim_x=cloth_dim_x,
+            dim_y=cloth_dim_y,
+            cell_x=cloth_cell,
+            cell_y=cloth_cell,
+            mass=0.05 * cloth_scale, # mass per vertex, 33x33x0.05 = 54.45 kg cloth???? v1 to v6: 0.05
+            fix_left=False, # set False for fully free falling cloth
+            fix_right=False,
+            # internal cloth stiffness params, does not affect cloth-object interaction stiffness
+            tri_ke=1.0e3 * cloth_scale, # elastic stiffness, was 1.0e3, v5: 2.0e2, v6: 1.0e2, in-plane stretch/shear stiffness of triangles. ###
+            tri_ka=1.0e3 * cloth_scale, # area stiffness, was 1.0e3, v5: 2.0e2, v6: 1.0e2, area preservation (resists becoming too squashed/expanded) ###
+            tri_kd=1.0e1 * cloth_scale, # damping, was 1.0e1, v5: 5.0e1, v6: 1.0e2, internal damping of the cloth, controlling how much it wiggles after being disturbed ###
+        )
+        
+        p_end = len(self.particle_q) # save cloth particle ids to enable cloth-finger collision
+        self.drop_cloth_ids = np.arange(p_start, p_end, dtype=np.int32) # capture the new particle ids, separate variable for the attached cloth
+
+
+
+
+    def add_connecting_cloth(
+        self,
+        finger_a: int = 0,
+        finger_b: int = 1,
+        edge_a: str = "right",
+        edge_b: str = "left",
+        dx_nominal: float | None = None,
+        span_subdiv: int | None = None,   # if set, overrides dx-based auto selection
+        mass_per_vertex: float = 1e-3,
+        tri_ke: float = 1.0e2,
+        tri_ka: float = 1.0e2,
+        tri_kd: float = 1.0e1,
+        tri_drag: float = 0.0,
+        tri_lift: float = 0.0,
+        max_span_subdiv: int = 32,
+    ):
+        """
+        MW_ADDED
+
+        Create a welded membrane cloth between two fingers.
+
+        - Using existing finger attachment particles (self.finger_attach_ids) as boundary vertices along the finger.
+        - Creates additional interior cloth vertices between the fingers.
+        - Adds triangles to form a rectangular cloth patch.
+        - Stores particle indices in self.attached_cloth_ids. Interior vertices are treated as cloth
+
+        Resolution across the gap is chosen as:
+        - If span_subdiv is not None:
+            use it directly (clamped to [1, max_span_subdiv]).
+        - Else if dx_nominal is not None:
+            use dx_nominal as target spacing across the gap.
+        - Else:
+            estimate dx from the actual attachment points along the finger.
+        """
+
+        # basic safety checks
+        if len(self.finger_left_attach_ids) <= max(finger_a, finger_b):
+            raise ValueError("finger *_attach_ids not initialized or finger index out of range")
+
+        # pick which edge of each finger to use
+        edge_ids_a = self._get_edge_ids(finger_a, edge_a)
+        edge_ids_b = self._get_edge_ids(finger_b, edge_b)
+
+        ids_a = np.array(edge_ids_a, dtype=np.int32)
+        ids_b = np.array(edge_ids_b, dtype=np.int32)
+
+
+        if ids_a.size == 0 or ids_b.size == 0:
+            # nothing to connect
+            return
+
+        # ensure both sides use the same number of samples along the finger
+        n = min(ids_a.size, ids_b.size)
+        if n < 2:
+            # cannot build a strip with less than 2 samples along the finger
+            return
+
+        ids_a = ids_a[:n]
+        ids_b = ids_b[:n]
+
+        # positions of boundary vertices (world space is fine for distances)
+        Pa = np.array([self.particle_q[i] for i in ids_a], dtype=float)
+        Pb = np.array([self.particle_q[i] for i in ids_b], dtype=float)
+
+        # Choose span_subdiv (number of interior segments across gap)
+        if span_subdiv is None:
+            # spacing along the finger
+            # - if dx_nominal is given: use that
+            # - otherwise: measure from attachments
+            dx_measured = None
+            diffs = np.linalg.norm(Pa[1:] - Pa[:-1], axis=1)
+            diffs = diffs[diffs > 1e-6]
+            if diffs.size > 0:
+                dx_measured = float(np.mean(diffs))
+
+            if dx_nominal is not None:
+                dx = float(dx_nominal)
+                # if you ever want to compare:
+                # print("dx_nominal:", dx, "dx_measured:", dx_measured)
+            else:
+                dx = dx_measured
+
+            # average gap between the two fingers
+            D = float(np.mean(np.linalg.norm(Pb - Pa, axis=1)))
+
+            if dx is not None and dx > 1e-6:
+                # isotropic-ish spacing: D / (span_subdiv + 1) ~ dx
+                est = D / dx
+                span_subdiv_est = int(round(est)) - 1
+                span_subdiv = max(1, min(max_span_subdiv, span_subdiv_est))
+            else:
+                # fallback: reasonable default
+                span_subdiv = 4
+        else:
+            # user (or caller) specified span_subdiv explicitly
+            span_subdiv = max(1, min(max_span_subdiv, int(span_subdiv)))
+
+        # Ensure all boundary vertices are wp.vec3 (add_triangle expects this)
+        boundary_ids = np.unique(np.concatenate([ids_a, ids_b])).astype(np.int32)
+        for pid in boundary_ids:
+            p = self.particle_q[pid]
+            if isinstance(p, (list, tuple, np.ndarray)):
+                p_arr = np.array(p, dtype=float)
+                self.particle_q[pid] = wp.vec3(float(p_arr[0]), float(p_arr[1]), float(p_arr[2]))
+
+        # Create interior cloth vertices between finger A and finger B
+        #
+        # layout per "column" along finger:
+        #   index 0          ...          num_across-1
+        #    A boundary  --- interior --- interior --- B boundary
+        num_across = span_subdiv + 2   # A boundary + interior + B boundary
+
+        # record start index for newly created cloth vertices
+        p_start = len(self.particle_q)
+        num_new = 0
+
+        # indices for all vertices in the cloth strip [length, across]
+        strip_indices = np.full((n, num_across), -1, dtype=np.int32)
+
+        # set boundary columns
+        strip_indices[:, 0]             = ids_a
+        strip_indices[:, num_across-1]  = ids_b
+
+        # create interior vertices (span_subdiv per column between A and B)
+        for i in range(n):
+            # positions of boundary vertices
+            pa = np.array(self.particle_q[ids_a[i]], dtype=float)
+            pb = np.array(self.particle_q[ids_b[i]], dtype=float)
+
+            # create span_subdiv interior points along the straight line from A to B
+            for k in range(span_subdiv):
+                alpha = float(k + 1) / float(span_subdiv + 1)   # in (0,1)
+                pos = (1.0 - alpha) * pa + alpha * pb
+
+                # add as a new particle (cloth vertex)
+                self.add_particle(
+                    wp.vec3(float(pos[0]), float(pos[1]), float(pos[2])),
+                    vel=wp.vec3(0.0, 0.0, 0.0),
+                    mass=mass_per_vertex
+                )
+
+                # index of this new particle
+                strip_indices[i, 1 + k] = p_start + num_new
+                num_new += 1
+
+        p_end = p_start + num_new
+
+        # store interior cloth vertex ids (one patch)
+        if num_new > 0:
+            interior_ids = np.arange(p_start, p_end, dtype=np.int32)
+            self.attached_cloth_ids.append(interior_ids)
+        else:
+            # no interior vertices created -> then this strip is degenerate
+            return
+
+        # store edge vertices for viz (finger–cloth boundary)
+        edge_ids = np.unique(np.concatenate([ids_a, ids_b])).astype(np.int32)
+        self.attached_cloth_edge_ids.append(edge_ids)
+
+        # Build triangles over the grid strip_indices (n along finger, num_across across gap)
+        for i in range(n - 1):
+            for j in range(num_across - 1):
+                v00 = int(strip_indices[i,     j])
+                v01 = int(strip_indices[i,     j + 1])
+                v10 = int(strip_indices[i + 1, j])
+                v11 = int(strip_indices[i + 1, j + 1])
+
+                # two triangles per quad:
+                #  v00 ----- v01
+                #   |       |
+                #   |       |
+                #  v10 ----- v11
+                self.add_triangle(v00, v10, v11, tri_ke, tri_ka, tri_kd, tri_drag, tri_lift)
+                self.add_triangle(v00, v11, v01, tri_ke, tri_ka, tri_kd, tri_drag, tri_lift)
+
 
 
 
@@ -919,9 +1163,17 @@ class TendonModelBuilder(ModelBuilder):
         if which == "spine":
             ids = spine_ids
         elif which == "edges":
+            # both edges together
             ids = np.concatenate([edge_ids_lo, edge_ids_hi])
+        elif which == "edge_lo":
+            # one edge only (z-min side in local coords)
+            ids = edge_ids_lo
+        elif which == "edge_hi":
+            # other edge only (z-max side in local coords)
+            ids = edge_ids_hi
         else:  # all (spine + edges)
             ids = np.concatenate([edge_ids_lo, spine_ids, edge_ids_hi])
+
 
         # sort selected ids along finger length
         P_sel = np.array([self.particle_q[i] for i in ids])
@@ -935,6 +1187,21 @@ class TendonModelBuilder(ModelBuilder):
             ids = ids[idxs]
 
         return ids.tolist()
+
+    def _get_edge_ids(self, finger_index: int, edge: str):
+        """
+        MW_ADDED
+        
+        Helper: return the attachment ids for a given finger and edge label.
+        edge: "left" or "right"
+        """
+        if edge == "left":
+            return self.finger_left_attach_ids[finger_index]
+        elif edge == "right":
+            return self.finger_right_attach_ids[finger_index]
+        else:
+            raise ValueError(f"Unknown edge label '{edge}', expected 'left' or 'right'")
+
 
     
     def find_back_ids(self, 

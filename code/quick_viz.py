@@ -57,7 +57,7 @@ def animate_point_clouds(point_clouds,
         if colors is not None:
             scat.set_color(colors)
         # actively spin camera around z (azim)
-        # ax.view_init(elev=elev, azim=azim + frame * 0.3)  # spin 0.3 deg per frame
+        ax.view_init(elev=elev, azim=azim + frame * 0.3)  # spin 0.3 deg per frame
         return scat,
 
     anim = FuncAnimation(fig, update, frames=T, interval=interval, blit=False)
@@ -228,7 +228,7 @@ def quick_visualize(tendon,
 
     # after running a sim and having tendon.states filled:
     # big cubes for easy inspection (adjust half_size if needed)
-    export_points_as_colored_cubes(P0, colors, "debug/finger_debug_cubes.ply", half_size=0.01)
+    # export_points_as_colored_cubes(P0, colors, "debug/finger_debug_cubes.ply", half_size=0.01)
 
 
     anim = animate_point_clouds(
