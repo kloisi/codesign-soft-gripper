@@ -512,7 +512,7 @@ class TendonModelBuilder(ModelBuilder):
         def _default_transform(i):
 
             # use a radius proportional to finger length, not thickness
-            R = max(finger_height, finger_LEN * 2.8)   # tweak 0.5 as you like
+            R = max(finger_height, finger_LEN * 4.0)   # tweak 0.5 as you like
             plane_y = h_dis + finger_height * 10.0
 
             # evenly spaced in angle
@@ -576,8 +576,8 @@ class TendonModelBuilder(ModelBuilder):
                 self.add_connecting_cloth(
                     finger_a=i,
                     finger_b=j,
-                    edge_a="right",
-                    edge_b="left",
+                    edge_a="left",
+                    edge_b="right",
                     dx_nominal=cell_size[0],
                     mass_per_vertex=1e-3,
                     tri_ke=1.0e2,
@@ -1094,17 +1094,16 @@ class TendonModelBuilder(ModelBuilder):
         coordinates before the global transform.
 
         1) Use self.finger_particle_ids[finger_index] to get all particles of
-        this finger in local coords.
+        this finger in local coords
 
-        2) Find the minimal local y (back side of the finger) and keep only
-        vertices with y <= y_min + tol.
+        2) Find the minimal local y (actual back side of the finger) and keep only
+        vertices with y <= y_min + tol
 
-        3) Sort those candidates along local x (finger length).
+        3) Sort those candidates along local x (finger length)
 
-        4) Interpret them as 3 'rows' according to layout and select
-        spine / edges / all.
+        4) Interpret them as 3 'rows' according to layout and select spine, edges or all
 
-        5) Subsample to num_attach points.
+        5) Subsample to num_attach points
         """
 
         finger_ids = self.finger_particle_ids[finger_index]
