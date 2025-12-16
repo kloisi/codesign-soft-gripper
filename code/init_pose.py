@@ -2,6 +2,8 @@ import os
 import numpy as np
 import torch
 import math
+import csv
+import matplotlib.pyplot as plt
 
 import warp as wp
 import utils
@@ -162,6 +164,12 @@ class InitializeFingers:
         self.transform_9d_wp= wp.zeros(9, dtype=wp.float32, requires_grad=True)
         # for arbitrary number of points (e.g. one value per finger)
         self.transform_2d_wp = wp.zeros(self.finger_num, dtype=wp.float32, requires_grad=True)
+
+        self.log = False
+        # --- History Storage ---
+        self.loss_history = []
+        self.radius_history = []
+        self.iter_history = []
 
 
         wp.launch(utils.transform_to11d, dim=1,
@@ -446,26 +454,78 @@ class InitializeFingers:
         with torch.no_grad():
             for i in range(self.finger_num):
                 self.transform_2d.clamp_(self.limit_low, self.limit_upp)
-                # if i < self.finger_num // 2:
-                #     # “left side” − fingers should be negative
-                #     self.transform_2d[i].clamp_(-self.limit_upp, -self.limit_low)
-                # else:
-                #     # “right side” − fingers should be positive
-                #     self.transform_2d[i].clamp_(self.limit_low, self.limit_upp)
-            # --- NEW: log current radius parameters ---
+
+            # --- log current radius and loss parameters ---
             current_radius = self.transform_2d.detach().cpu().numpy().copy()
+            current_loss = self.loss.item()
 
+            # --- store history ---
+            self.loss_history.append(current_loss)
+            self.radius_history.append(current_radius)
+            self.iter_history.append(iter)
 
-            # print every e.g. 100 iters
+            # log to console
             if iter % 10 == 0:
-                print(f"[iter {iter}] radius params (transform_2d): {current_radius}")
-
-        if iter % 1000 == 0:
-            print("iter:", iter, "loss:", self.loss)
+                print(f"[iter {iter}] Radius: {current_radius} | Loss: {current_loss:.6f}")
 
         self.state0, self.state1 = self.state1, self.state0
         self.optimizer.zero_grad()
         self.total_dis.zero_()
+
+    def export_and_plot(self, output_dir="opt_results", threshold=None):
+        """Saves optimization history to CSV and plots graphs."""
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        
+        # 1. Save to CSV
+        csv_filename = os.path.join(output_dir, f"log_{self.ycb_object_name}_pose{self.pose_id}.csv")
+        print(f"Saving CSV to {csv_filename}...")
+        
+        with open(csv_filename, mode='w', newline='') as file:
+            writer = csv.writer(file)
+            # Header: Iteration, Loss, Finger_0, Finger_1, ...
+            headers = ["Iteration", "Loss"] + [f"Finger_{i}_Radius" for i in range(self.finger_num)]
+            writer.writerow(headers)
+            
+            for i in range(len(self.iter_history)):
+                row = [self.iter_history[i], self.loss_history[i]]
+                row.extend(self.radius_history[i]) # Add all finger radii
+                writer.writerow(row)
+
+        # 2. Plot Loss vs Iteration
+        plt.figure(figsize=(10, 5))
+        plt.plot(self.iter_history, self.loss_history, label='Loss', color='red', linewidth=1.5)
+
+        # --- NEW: Add Threshold Line ---
+        if threshold is not None and False:
+            plt.axhline(y=threshold, color='green', linestyle='--', label=f'Convergence Threshold ({threshold})')
+        # Use Log Scale so we can actually see 1e-5
+        plt.yscale('log')
+        plt.xlabel('Iterations')
+        plt.ylabel('Loss (Log Scale)')
+        plt.title(f'Optimization Loss - {self.ycb_object_name}')
+        plt.grid(True, which="both", ls="-", alpha=0.2) # finer grid for log scale
+        plt.legend()
+        plt.savefig(os.path.join(output_dir, f"plot_loss_{self.ycb_object_name}.png"))
+        plt.close()
+
+        # 3. Plot Radius vs Iteration
+        plt.figure(figsize=(10, 5))
+        # Convert list of arrays to a 2D array for easier plotting [iters, fingers]
+        radii_array = np.array(self.radius_history) 
+        
+        for i in range(self.finger_num):
+            plt.plot(self.iter_history, radii_array[:, i], label=f'Finger {i}')
+            
+        plt.xlabel('Iterations')
+        plt.ylabel('Radius (meters)')
+        plt.title(f'Finger Radius Optimization - {self.ycb_object_name}')
+        plt.grid(True)
+        plt.legend()
+        plt.savefig(os.path.join(output_dir, f"plot_radius_{self.ycb_object_name}.png"))
+        plt.close()
+        
+        print(f"Plots saved to {output_dir}")
 
     def render(self):
         if self.renderer is None:
@@ -510,6 +570,10 @@ class InitializeFingers:
             prev_loss = self.loss.item()
 
             if self.is_render: self.render()
+
+        # --- export and plot results ---
+        if self.log:
+            self.export_and_plot(threshold=convergence_threshold)
 
         if self.loss.item() > 1.0:
             print("Warning: Loss did not converge properly. Current loss:", self.loss.item())
