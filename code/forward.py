@@ -15,6 +15,7 @@ from object_loader import ObjectLoader
 from integrator_euler_fem import FEMIntegrator
 from tendon_model import TendonModelBuilder, TendonRenderer, TendonHolder
 from init_pose import InitializeFingers
+from force_optimizer import FEMForceOptimization
 
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, FFMpegWriter
@@ -71,6 +72,7 @@ class FEMTendon:
                  object_density=1e1,
                  finger_len=9, finger_rot=np.pi/9, finger_width=0.08, scale=4.0, finger_transform=None,
                  finger_num=2,
+                 requires_grad=True,
                  init_finger=None):
         self.verbose = verbose
         self.save_log = save_log
@@ -84,7 +86,7 @@ class FEMTendon:
         self.render_time = 0.0
         self.iter = 0
         self.train_iters = train_iters
-        self.requires_grad = False
+        self.requires_grad = requires_grad
 
         self.obj_loader = ObjectLoader()
         self.finger_len = finger_len # need to be odd number
@@ -232,7 +234,7 @@ class FEMTendon:
         self.control.vel_values = wp.array(
             np.zeros([1, 3]),
             dtype=wp.vec3, requires_grad=self.requires_grad)
-        self.tendon_forces = wp.array([100.0]*self.finger_num, dtype=wp.float32, requires_grad=self.requires_grad)
+        self.tendon_forces = wp.array([10.0]*self.finger_num, dtype=wp.float32, requires_grad=self.requires_grad)
 
         self.tendon_holder.init_tendon_variables(requires_grad=self.requires_grad)
     
@@ -403,6 +405,60 @@ class FEMTendon:
                 self.renderer.end_frame()
                 self.render_time += self.frame_dt
 
+    def optimize_forces(self, iterations=8, learning_rate=500.0, opt_frames=10):
+        print(f"--- Optimizing Forces (Numerical) for {iterations} iters ---")
+        
+        # Configuration
+        epsilon = 10.0
+        current_forces = self.tendon_forces.numpy().copy()
+        num_tendons = len(current_forces)
+        
+        for iter_idx in range(iterations):
+            gradients = np.zeros(num_tendons)
+            
+            # 1. Base Run using the new Class Wrapper
+            loss_base = FEMForceOptimization.run(
+                torch.tensor(current_forces, dtype=torch.float32, device='cuda'), 
+                self.model, 
+                self.states, 
+                self.integrator, 
+                self.sim_dt, 
+                self.control, 
+                self.tendon_holder, 
+                self.sim_substeps, 
+                opt_frames, 
+                self.builder.finger_vertex_ranges
+            )
+            
+            print(f"Iter {iter_idx}: Base Loss {loss_base:.4f} | Forces {current_forces}")
+
+            # 2. Gradient Calculation Loop
+            for t in range(num_tendons):
+                test_forces = current_forces.copy()
+                test_forces[t] += epsilon
+                
+                loss_new = FEMForceOptimization.run(
+                    torch.tensor(test_forces, dtype=torch.float32, device='cuda'),
+                    self.model,
+                    self.states, 
+                    self.integrator, 
+                    self.sim_dt, 
+                    self.control, 
+                    self.tendon_holder, 
+                    self.sim_substeps, opt_frames, 
+                    self.builder.finger_vertex_ranges
+                )
+                
+                gradients[t] = (loss_new - loss_base) / epsilon
+            
+            # 3. Update Step
+            current_forces = current_forces - (learning_rate * gradients)
+            current_forces = np.clip(current_forces, 0.0, 200.0)
+
+        # Save Final Result
+        self.tendon_forces = wp.from_numpy(current_forces.astype(np.float32), device='cuda')
+        print(f"--- Done. Final Forces: {current_forces} ---")
+
     
 if __name__ == "__main__":
     import argparse
@@ -509,8 +565,12 @@ if __name__ == "__main__":
             scale=scale,
             finger_transform=finger_transform,
             finger_num=args.finger_num,
+            requires_grad=True,
             init_finger=init_finger)
 
+        # --- optimize forces ---
+        if not args.no_init:
+            tendon.optimize_forces(iterations=100, learning_rate=5.0, opt_frames=100)
 
 
         tendon.forward()
