@@ -9,6 +9,8 @@ import warp.sim
 import warp.sim.render
 import warp.optim
 from enum import Enum
+import pandas as pd
+import matplotlib.pyplot as plt
 
 import utils
 from object_loader import ObjectLoader
@@ -118,7 +120,7 @@ class FEMTendon:
                           obj_rot=object_rot,
                           scale=self.scale,
                           use_simple_mesh=False,
-                          is_fix=False,
+                          is_fix=True,
                           density=object_density,
                           )
         self.builder.init_builder_tendon_variables(self.finger_num, self.finger_len, self.scale, self.requires_grad)
@@ -405,18 +407,24 @@ class FEMTendon:
                 self.renderer.end_frame()
                 self.render_time += self.frame_dt
 
-    def optimize_forces(self, iterations=8, learning_rate=500.0, opt_frames=10):
-        print(f"--- Optimizing Forces (Numerical) for {iterations} iters ---")
+    def optimize_forces(self, iterations=10, learning_rate=0.1, opt_frames=1000):
+        print(f"--- Optimizing Forces (Numerical SGD) ---")
         
         # Configuration
         epsilon = 10.0
         current_forces = self.tendon_forces.numpy().copy()
         num_tendons = len(current_forces)
         
+        # History tracker
+        history = {
+            "loss": [],
+            "forces": []
+        }
+        
         for iter_idx in range(iterations):
             gradients = np.zeros(num_tendons)
             
-            # 1. Base Run using the new Class Wrapper
+            # 1. Base Run
             loss_base = FEMForceOptimization.run(
                 torch.tensor(current_forces, dtype=torch.float32, device='cuda'), 
                 self.model, 
@@ -430,7 +438,11 @@ class FEMTendon:
                 self.builder.finger_vertex_ranges
             )
             
-            print(f"Iter {iter_idx}: Base Loss {loss_base:.4f} | Forces {current_forces}")
+            print(f"Iter {iter_idx}: Base Loss {loss_base:.4f}")
+            
+            # Log Data
+            history["loss"].append(float(loss_base))
+            history["forces"].append(current_forces.copy().tolist())
 
             # 2. Gradient Calculation Loop
             for t in range(num_tendons):
@@ -445,7 +457,8 @@ class FEMTendon:
                     self.sim_dt, 
                     self.control, 
                     self.tendon_holder, 
-                    self.sim_substeps, opt_frames, 
+                    self.sim_substeps, 
+                    opt_frames, 
                     self.builder.finger_vertex_ranges
                 )
                 
@@ -453,11 +466,285 @@ class FEMTendon:
             
             # 3. Update Step
             current_forces = current_forces - (learning_rate * gradients)
-            current_forces = np.clip(current_forces, 0.0, 200.0)
+            current_forces = np.clip(current_forces, 0.0, 100.0)
 
         # Save Final Result
         self.tendon_forces = wp.from_numpy(current_forces.astype(np.float32), device='cuda')
         print(f"--- Done. Final Forces: {current_forces} ---")
+        return history
+
+    def optimize_forces_autodiff(self, iterations=10, learning_rate=0.01, opt_frames=1000):
+        print(f"--- Optimizing Forces (Autodiff) ---")
+        
+        # 1. Create Tensor
+        forces_param = torch.tensor(self.tendon_forces.numpy(), device='cuda', requires_grad=True)
+        
+        # 2. Optimizer
+        optimizer = torch.optim.Adam([forces_param], lr=learning_rate)
+        
+        # History tracker
+        history = {
+            "loss": [],
+            "forces": []
+        }
+        
+        for i in range(iterations):
+            optimizer.zero_grad()
+            
+            # 3. Forward Pass
+            loss = FEMForceOptimization.apply(
+                forces_param,
+                self.model, 
+                self.states, 
+                self.integrator, 
+                self.sim_dt, 
+                self.control, 
+                self.tendon_holder, 
+                self.sim_substeps, 
+                opt_frames, 
+                self.builder.finger_vertex_ranges
+            )
+            
+            # Log Data (Before backward/update)
+            history["loss"].append(loss.item())
+            history["forces"].append(forces_param.detach().cpu().numpy().tolist())
+            print(f"Iter {i}: Loss {loss.item():.4f}")
+            
+            # 4. Backward Pass
+            loss.backward()
+
+            # NaN Check and Clipping
+            if forces_param.grad is not None:
+                if torch.isnan(forces_param.grad).any():
+                    print(f"Iter {i}: !!! GRADIENTS ARE NaN !!! Skipping step.")
+                    optimizer.zero_grad()
+                    continue
+
+                torch.nn.utils.clip_grad_norm_([forces_param], max_norm=1.0)
+            
+            # 5. Step
+            optimizer.step()
+            
+            # Clip forces to valid range
+            with torch.no_grad():
+                forces_param.clamp_(0.0, 100.0)
+
+        # Save Final Result
+        self.tendon_forces = wp.from_torch(forces_param.detach())
+        print(f"--- Done. Final Forces: {forces_param.detach().cpu().numpy()} ---")
+        return history
+
+    def optimize_forces_adam(self, iterations=10, learning_rate=10.0, opt_frames=10):
+        print(f"--- Optimizing Forces (Numerical + Adam) ---")
+        
+        # Configuration
+        epsilon = 15.0 
+        
+        # 1. Setup Tensor
+        forces_param = torch.tensor(self.tendon_forces.numpy(), dtype=torch.float32, device='cuda', requires_grad=True)
+        num_tendons = len(forces_param)
+        
+        # 2. Initialize Adam
+        optimizer = torch.optim.Adam([forces_param], lr=learning_rate)
+        
+        # History tracker
+        history = {
+            "loss": [],
+            "forces": []
+        }
+        
+        for iter_idx in range(iterations):
+            optimizer.zero_grad()
+            
+            # Step A: Base Run
+            forces_np = forces_param.detach().cpu().numpy()
+            
+            loss_base = FEMForceOptimization.run(
+                torch.tensor(forces_np, device='cuda'), 
+                self.model, self.states, self.integrator, self.sim_dt, 
+                self.control, self.tendon_holder, self.sim_substeps, 
+                opt_frames, self.builder.finger_vertex_ranges
+            )
+            
+            print(f"Iter {iter_idx}: Base Loss {loss_base:.4f}")
+            
+            # Log Data
+            history["loss"].append(float(loss_base))
+            history["forces"].append(forces_np.tolist())
+
+            # Step B: Calculate Gradients (Numerical)
+            grads_buffer = np.zeros(num_tendons, dtype=np.float32)
+            
+            for t in range(num_tendons):
+                test_forces = forces_np.copy()
+                test_forces[t] += epsilon
+                
+                loss_new = FEMForceOptimization.run(
+                    torch.tensor(test_forces, device='cuda'),
+                    self.model, self.states, self.integrator, self.sim_dt, 
+                    self.control, self.tendon_holder, self.sim_substeps, 
+                    opt_frames, self.builder.finger_vertex_ranges
+                )
+                
+                # Calculate slope
+                grads_buffer[t] = (loss_new - loss_base) / epsilon
+
+            # Step C: Inject Gradients into Adam
+            forces_param.grad = torch.from_numpy(grads_buffer).to(device='cuda')
+            
+            # Step D: Update
+            optimizer.step()
+            
+            # Clip to valid range
+            with torch.no_grad():
+                forces_param.clamp_(0.0, 100.0)
+
+        # Save Final Result
+        self.tendon_forces = wp.from_torch(forces_param.detach())
+        print(f"--- Done. Final Forces: {forces_param.detach().cpu().numpy()} ---")
+        return history
+
+    def optimize_forces_lbfgs(self, iterations=10, learning_rate=1.0, opt_frames=10):
+        print(f"--- Optimizing Forces (Numerical + L-BFGS) ---")
+        
+        max_force = 100.0
+        epsilon = 5.0 
+
+        # x = log(p / (1-p)) where p is percentage of max force
+        start_vals = self.tendon_forces.numpy() / max_force
+        start_vals = np.clip(start_vals, 0.01, 0.99) # Prevent div by zero
+        start_latents = np.log(start_vals / (1.0 - start_vals))
+
+        #forces_param = torch.tensor(self.tendon_forces.numpy(), dtype=torch.float32, device='cuda', requires_grad=True)
+        latents_param = torch.tensor(start_latents, dtype=torch.float32, device='cuda', requires_grad=True)
+        num_tendons = len(latents_param)
+        
+        # L-BFGS Setup
+        optimizer = torch.optim.LBFGS([latents_param], lr=learning_rate, max_iter=5)
+        
+        # History tracker
+        history = {
+            "loss": [],
+            "forces": []
+        }
+        
+        # L-BFGS Closure
+        def closure():
+            optimizer.zero_grad()
+            
+            # 1. Base Run
+            current_forces = max_force * torch.sigmoid(latents_param)
+            forces_np = current_forces.detach().cpu().numpy()
+            
+            loss_base = FEMForceOptimization.run(
+                torch.tensor(forces_np, device='cuda'), 
+                self.model, self.states, self.integrator, self.sim_dt, 
+                self.control, self.tendon_holder, self.sim_substeps, 
+                opt_frames, self.builder.finger_vertex_ranges
+            )
+            print(f"   L-BFGS Evaluation Loss: {loss_base:.4f}")
+            
+            # Log Data (Note: L-BFGS calls this multiple times per 'step')
+            # We log every evaluation to see the line search progress
+            history["loss"].append(float(loss_base))
+            history["forces"].append(forces_np.tolist())
+            
+            # 2. Gradient Calculation (Numerical)
+            grads_buffer = np.zeros(num_tendons, dtype=np.float32)
+            latents_np = latents_param.detach().cpu().numpy()
+            for t in range(num_tendons):
+                test_latents = latents_np.copy()
+                test_latents[t] += epsilon
+                test_forces = max_force * (1.0 / (1.0 + np.exp(-test_latents)))
+                loss_new = FEMForceOptimization.run(
+                    torch.tensor(test_forces, device='cuda'),
+                    self.model, self.states, self.integrator, self.sim_dt, 
+                    self.control, self.tendon_holder, self.sim_substeps, 
+                    opt_frames, self.builder.finger_vertex_ranges
+                )
+                grads_buffer[t] = (loss_new - loss_base) / epsilon
+            
+            # 3. Inject Gradient
+            latents_param.grad = torch.from_numpy(grads_buffer).to(device='cuda')
+            
+            return torch.tensor(loss_base)
+
+        for i in range(iterations):
+            print(f"Iter {i}:")
+            optimizer.step(closure)
+            
+
+        # Save Final Result
+        final_forces = max_force * torch.sigmoid(latents_param)
+        self.tendon_forces = wp.from_torch(final_forces.detach())
+        print(f"--- Done. Final Forces: {final_forces.detach().cpu().numpy()} ---")
+        return history
+    
+    def plot_single_run(self, history, method_name="Optimization", save_dir="logs"):
+        """
+        Plots loss and forces for a single optimization run and saves data to CSV.
+        
+        Args:
+            history: Dict containing 'loss' (list) and 'forces' (list of lists).
+            method_name: Label for the plots and filename (e.g., 'Adam', 'SGD').
+            save_dir: Folder to save outputs.
+        """
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+        # --- 1. Save Data to CSV ---
+        data = []
+        num_iters = len(history['loss'])
+        num_tendons = len(history['forces'][0])
+
+        for i in range(num_iters):
+            row = {
+                "Iteration": i,
+                "Loss": history['loss'][i]
+            }
+            for t in range(num_tendons):
+                row[f"Force_{t}"] = history['forces'][i][t]
+            data.append(row)
+
+        df = pd.DataFrame(data)
+        csv_filename = f"{method_name}_results.csv"
+        df.to_csv(os.path.join(save_dir, csv_filename), index=False)
+        print(f"[{method_name}] Data saved to {csv_filename}")
+
+        # --- 2. Generate Plots ---
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+        
+        # Plot A: Loss
+        ax1.plot(df["Iteration"], df["Loss"], 'b-o', linewidth=2, label="Loss")
+        ax1.set_title(f"{method_name}: Loss Convergence")
+        ax1.set_xlabel("Iteration")
+        ax1.set_ylabel("Total Loss")
+        ax1.grid(True, linestyle='--', alpha=0.7)
+        ax1.legend()
+
+        # Plot B: Forces
+        # We plot every tendon individually
+        colors = plt.cm.jet(np.linspace(0, 1, num_tendons))
+        for t in range(num_tendons):
+            ax2.plot(df["Iteration"], df[f"Force_{t}"], 
+                    label=f"Tendon {t}", color=colors[t], linewidth=1.5, alpha=0.8)
+
+        ax2.set_title(f"{method_name}: Force Trajectories")
+        ax2.set_xlabel("Iteration")
+        ax2.set_ylabel("Force (N)")
+        ax2.grid(True, linestyle='--', alpha=0.7)
+        
+        # Handle legend placement if there are many tendons
+        if num_tendons <= 5:
+            ax2.legend(loc='best')
+        else:
+            ax2.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize='small')
+
+        plt.tight_layout()
+        plot_filename = f"{method_name}_plot.png"
+        plt.savefig(os.path.join(save_dir, plot_filename), dpi=150)
+        print(f"[{method_name}] Plots saved to {plot_filename}")
+        plt.close(fig)
 
     
 if __name__ == "__main__":
@@ -497,6 +784,9 @@ if __name__ == "__main__":
     parser.add_argument("--quick_viz_elev", type=float, default=30, help="Camera elevation.")
     parser.add_argument("--quick_viz_azim", type=float, default=45, help="Camera azimuth.")
 
+    # optimizer choice
+    parser.add_argument("--optimizer", type=str, default="lbfgs", choices=["sgd", "adam", "autodiff", "lbfgs"], help="Choose the optimization method.")
+
 
     args = parser.parse_known_args()[0]
 
@@ -514,7 +804,7 @@ if __name__ == "__main__":
         finger_transform = None
         init_finger_q = None
 
-        if not args.no_init:
+        if not args.no_init and True:
             print("Running InitializeFingers to optimise initial pose...")
             init_finger = InitializeFingers(
                 stage_path="femtendon_sim.usd",     # or args.stage_path, doesn’t really matter here
@@ -569,8 +859,39 @@ if __name__ == "__main__":
             init_finger=init_finger)
 
         # --- optimize forces ---
+        history = None
+        method_name = args.optimizer
+
         if not args.no_init:
-            tendon.optimize_forces(iterations=100, learning_rate=5.0, opt_frames=100)
+            print(f"--- Running optimization using: {method_name.upper()} ---")
+            
+            if method_name == "sgd":
+                history = tendon.optimize_forces(
+                    iterations=10, learning_rate=0.1, opt_frames=100
+                )
+            
+            elif method_name == "adam":
+                history = tendon.optimize_forces_adam(
+                    iterations=20, learning_rate=10.0, opt_frames=100
+                )
+            
+            elif method_name == "autodiff":
+                # Autodiff needs a much smaller LR
+                history = tendon.optimize_forces_autodiff(
+                    iterations=10, learning_rate=0.01, opt_frames=100
+                )
+            
+            elif method_name == "lbfgs":
+                # LBFGS usually runs fewer iterations but does more work per step
+                history = tendon.optimize_forces_lbfgs(
+                    iterations=10, learning_rate=1.0, opt_frames=100
+                )
+
+            # --- Automatic Plotting ---
+            if history is not None:
+                tendon.plot_single_run(history, method_name=method_name, save_dir="logs")
+            else:
+                print("No optimization run (history is None).")
 
 
         tendon.forward()
