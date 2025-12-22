@@ -785,7 +785,7 @@ if __name__ == "__main__":
 
     # optimizer choice
     parser.add_argument("--optimizer", type=str, default="lbfgs", choices=["sgd", "adam", "autodiff", "lbfgs"], help="Choose the optimization method.")
-
+    parser.add_argument("--no_force_opt", action="store_true", help="Disable force optimization.")
 
     args = parser.parse_known_args()[0]
 
@@ -871,7 +871,7 @@ if __name__ == "__main__":
         history = None
         method_name = args.optimizer
 
-        if not args.no_init:
+        if not args.no_force_opt:
             print(f"--- Running optimization using: {method_name.upper()} ---")
             
             if method_name == "sgd":
@@ -893,7 +893,7 @@ if __name__ == "__main__":
             elif method_name == "lbfgs":
                 # LBFGS usually runs fewer iterations but does more work per step
                 history = tendon.optimize_forces_lbfgs(
-                    iterations=10, learning_rate=1.0, opt_frames=100
+                    iterations=1, learning_rate=1.0, opt_frames=100
                 )
 
             # --- Automatic Plotting ---
