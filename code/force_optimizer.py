@@ -59,7 +59,12 @@ class FEMForceOptimization(torch.autograd.Function):
             
             wp.launch(utils.mesh_dis, 
                       dim=len(curr_finger_meshes[i]), 
-                      inputs=[model.shape_geo, 0, 0, final_state.body_q, curr_finger_meshes[i], 
+                      inputs=[model.shape_geo, 
+                              0, 
+                              model.shape_body, 
+                              model.shape_transform, 
+                              final_state.body_q, 
+                              curr_finger_meshes[i], 
                               model.soft_contact_margin*1.5, 
                               10.0, 1e3, 0], 
                       outputs=[total_dis])

@@ -459,9 +459,9 @@ def multi_transform_from11d(transform_9d: wp.array(dtype=float),
     b2 = a2 - (wp.dot(b1, a2) * b1)
     b2_norm = wp.normalize(b2)
     b3 = wp.cross(b1, b2_norm)
-    # R_t = wp.mat33(b1, b2_norm, b3)
-    # R = wp.transpose(R_t)
-    R = wp.matrix_from_cols(b1, b2_norm, b3)
+    R_t = wp.mat33(b1, b2_norm, b3)
+    R = wp.transpose(R_t)
+    #R = wp.matrix_from_cols(b1, b2_norm, b3)
     trans_q = wp.quat_from_matrix(R)
     T = wp.transform(
         wp.vec3(transform_9d[offset_9d + 0], transform_9d[offset_9d + 1], transform_9d[offset_9d + 2]),
