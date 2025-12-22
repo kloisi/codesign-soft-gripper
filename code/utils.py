@@ -4,6 +4,16 @@ from warp.sim.collide import mesh_sdf
 from warp.sim.model import ModelShapeGeometry, State
 from scipy.spatial.transform import Rotation   
 
+@wp.kernel
+def copy_finger_particles(
+    global_particles: wp.array(dtype=wp.vec3),
+    start_idx: int,
+    out_finger_mesh: wp.array(dtype=wp.vec3)
+):
+    tid = wp.tid()
+    # Copy from the big simulation array into the specific finger buffer
+    out_finger_mesh[tid] = global_particles[tid + start_idx]
+
 def get_sharp_y(x, Lx, Ly, beta, x0):
     # Lx, Ly, beta, x0
     return (Ly - beta) * Lx / (Lx - x0) * (1 - x / Lx) + beta
