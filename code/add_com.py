@@ -1,10 +1,13 @@
 import os, numpy as np, trimesh as tm
+from pathlib import Path
 
-obj = "fungia_scutaria"
-mesh_path = f"models/ycb/{obj}/google_16k/nontextured.ply"   # your coral mesh path
-assert os.path.exists(mesh_path), f"Missing mesh at {mesh_path}"
+obj = "acropora_cervicornis"  # your coral object name
+HERE = Path(__file__).resolve().parent          # .../code
+REPO = HERE.parent                              # .../ (repo root)  <-- adjust if needed
+mesh_path = REPO / "models" / "ycb" / obj / "google_16k" / "nontextured.ply"
 
-m = tm.load(mesh_path, force='mesh')
+assert mesh_path.is_file(), f"Missing mesh at {mesh_path}"
+m = tm.load(mesh_path, force="mesh")
 if not isinstance(m, tm.Trimesh):
     # some files load as Scene; merge to single mesh
     m = tm.util.concatenate(m.dump())
@@ -19,14 +22,16 @@ except Exception:
 
 com = np.asarray(com, dtype=np.float32)
 
-# write/update models/coms/coms.npz
-path = "models/coms/coms.npz"
-if os.path.exists(path):
+# write/update models/coms/coms.npz (absolute, robust)
+path = REPO / "models" / "coms" / "coms.npz"
+path.parent.mkdir(parents=True, exist_ok=True)
+
+if path.exists():
     d = dict(np.load(path, allow_pickle=True)["com_dict"].item())
 else:
     d = {}
+
 d[obj] = com
-os.makedirs("pose_info", exist_ok=True)
 np.savez(path, com_dict=d)
 
 print(f"{obj} COM:", com, "-> wrote", path)

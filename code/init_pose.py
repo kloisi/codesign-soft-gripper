@@ -9,6 +9,30 @@ import utils
 from tendon_model import TendonModel, TendonModelBuilder, TendonRenderer, TendonHolder
 from object_loader import ObjectLoader
 
+
+"""
+Rigid init optimisation (finger + optional cloth proxy)
+
+1) Convert (transform_9d, transform_2d) -> joint_q
+   - transform_9d: wrist SE(3) in 9D (t + first two rotation columns)
+   - transform_2d: per finger prismatic "radius" values
+2) Run FK to compute rigid body poses (state_in.body_q) and copy to state_out.
+3) For each finger i:
+   - transform local mesh vertices -> world space (curr_finger_mesh[i])
+   - accumulate finger-object SDF penalty at finger vertices (utils.mesh_dis)
+4) Cloth proxy penalty (optional):
+   - for each neighbouring finger pair (a, b), take the precomputed “facing edge”
+     vertex id lists from the attachment edges:
+       ids_a = cloth_left_ids[a], ids_b = cloth_right_ids[b]
+   - for each alpha in cloth_alphas, create proxy points
+       p = (1-alpha) * verts_a[ids_a] + alpha * verts_b[ids_b]
+     (computed inside the kernel, no intermediate buffers)
+   - evaluate object mesh SDF at p and add hinge-style penalties:
+       penetration within margin, and optionally being too far from the surface
+"""
+
+
+
 class ForwardKinematics(torch.autograd.Function):
     @staticmethod
     def forward(ctx, transform_9d, 
@@ -23,7 +47,19 @@ class ForwardKinematics(torch.autograd.Function):
                 finger_body_ids,
                 object_com,
                 distance_param,
-                total_dis
+                finger_dis,
+                cloth_dis,
+                obj_geo_id,
+                obj_body_id,
+                consider_cloth,
+                cloth_pairs,
+                cloth_left_ids,
+                cloth_right_ids,
+                cloth_alphas,
+                cloth_margin_mult,
+                cloth_dist_param,
+                cloth_pen_param,
+                cloth_weight
                 ):
         ctx.tape = wp.Tape()
         ctx.model = model
@@ -38,7 +74,23 @@ class ForwardKinematics(torch.autograd.Function):
         ctx.curr_finger_mesh = curr_finger_mesh
         
         ctx.finger_mesh = finger_mesh
-        ctx.total_dis = total_dis
+
+        ctx.finger_dis = finger_dis
+        ctx.cloth_dis  = cloth_dis
+
+        ctx.obj_geo_id = obj_geo_id
+        ctx.obj_body_id = obj_body_id
+        ctx.consider_cloth = consider_cloth
+
+        ctx.cloth_pairs = cloth_pairs
+        ctx.cloth_left_ids = cloth_left_ids
+        ctx.cloth_right_ids = cloth_right_ids
+        ctx.cloth_alphas = cloth_alphas
+
+        ctx.cloth_margin_mult = cloth_margin_mult
+        ctx.cloth_dist_param = cloth_dist_param
+        ctx.cloth_pen_param = cloth_pen_param
+        ctx.cloth_weight = cloth_weight
 
         with ctx.tape:
             ctx.state_in.clear_forces()
@@ -46,36 +98,90 @@ class ForwardKinematics(torch.autograd.Function):
                     inputs=[ctx.transform_9d, ctx.transform_2d],
                     outputs=[ctx.joint_q])
             
-            wp.sim.eval_fk(ctx.model, ctx.joint_q, ctx.model.joint_qd, None, ctx.state_in)
+            wp.sim.eval_fk(ctx.model, ctx.joint_q, ctx.model.joint_qd, None, ctx.state_in) # computes the rigid body poses from kinematics into state_in.body_q
             
             # wp.sim.collide(ctx.model, ctx.state_in)
-            ctx.intergrator.simulate(ctx.model, ctx.state_in, ctx.state_out, ctx.sim_dt)
+            # ctx.intergrator.simulate(ctx.model, ctx.state_in, ctx.state_out, ctx.sim_dt) # advances one rigid dynamics step and writes poses into state_out.body_q
+
+            # Copy FK poses to state_out so the rest of your code stays unchanged
+            ctx.state_out.body_q = wp.clone(ctx.state_in.body_q)
+
             for i in range(len(curr_finger_mesh)):
                 wp.launch(utils.transform_points_out,
                         dim=len(ctx.curr_finger_mesh[i]),
                         inputs=[ctx.finger_mesh[i],
                                 finger_body_ids[i],
-                                ctx.state_in.body_q],
+                                ctx.state_out.body_q], # use state_in or state_out ???
                         outputs=[ctx.curr_finger_mesh[i]])
             
                 wp.launch(utils.mesh_dis, 
                         dim=len(ctx.curr_finger_mesh[i]),
                         inputs=[ctx.model.shape_geo, 
-                                0, 0,
+                                ctx.obj_geo_id,
+                                ctx.model.shape_body,
+                                ctx.model.shape_transform,
                                 ctx.state_out.body_q,
                                 ctx.curr_finger_mesh[i],
                                 # ctx.model.rigid_contact_margin*1.0,
                                 ctx.model.object_contact_margin*1.0,
                                 1e-1,
                                 1e3, 0],
-                        outputs=[ctx.total_dis])
-        return (wp.to_torch(ctx.total_dis))
+                        outputs=[ctx.finger_dis])
+
+            
+            # Cloth-aware init: proxy cloth penalty
+
+            if ctx.consider_cloth and (len(ctx.cloth_pairs) > 0):
+                #k = ctx.cloth_k  # use the actual k
+                margin = ctx.model.object_contact_margin * ctx.cloth_margin_mult
+                beta   = 50.0
+                w      = ctx.cloth_pen_param * ctx.cloth_weight
+                d_target = 3.0 * margin   # has no visible effect (compared 0.3 to 1000)
+                w_far = ctx.cloth_dist_param
+                w_pen = ctx.cloth_pen_param
+
+
+                for (a, b) in ctx.cloth_pairs:
+                    ids_a = ctx.cloth_left_ids[a]
+                    ids_b = ctx.cloth_right_ids[b]
+
+                    k = ids_a.shape[0]
+
+                    for alpha in ctx.cloth_alphas:
+                        wp.launch(
+                            utils.cloth_proxy_barrier_pair,
+                            dim=k,
+                            inputs=[ctx.model.shape_geo,
+                                ctx.obj_geo_id,
+                                ctx.model.shape_body,
+                                ctx.model.shape_transform,
+                                ctx.state_out.body_q,
+
+                                ctx.curr_finger_mesh[a], ids_a,
+                                ctx.curr_finger_mesh[b], ids_b,
+
+                                float(alpha),
+                                margin, beta, 
+                                w_far, w_pen, d_target,
+                            ],
+                            outputs=[ctx.cloth_dis],
+                        )
+    
+        # return torch tensor
+        finger_E = wp.to_torch(ctx.finger_dis)[0]
+        cloth_E  = wp.to_torch(ctx.cloth_dis)[0]
+        return torch.stack([finger_E, cloth_E])
+
     
     @staticmethod
     def backward(ctx, adj_total_dis):
         max_grad_trans = 1.0
         max_grad_rot = 1e-8
-        ctx.total_dis.grad = wp.from_torch(adj_total_dis)
+
+        # seed output grads (shape (1,) each)
+        ctx.finger_dis.grad = wp.from_torch(adj_total_dis[0:1].contiguous())
+        ctx.cloth_dis.grad  = wp.from_torch(adj_total_dis[1:2].contiguous())
+
         ctx.tape.backward()
 
         trans9d_grad = wp.to_torch(ctx.tape.gradients[ctx.transform_9d]).clone()
@@ -91,7 +197,10 @@ class ForwardKinematics(torch.autograd.Function):
 
         ctx.tape.zero()
      
-        return tuple([trans9d_grad] + [trans2d_grad] + [None]*11) # 11
+        #return tuple([trans9d_grad] + [trans2d_grad] + [None]*11) # 11
+        # forward() now has 25 args (2 tensors + 23 non-tensors)
+        return tuple([trans9d_grad] + [trans2d_grad] + [None]*23)
+
 
 class InitializeFingers:
     def __init__(self, stage_path="femtendon_sim.usd", 
@@ -112,7 +221,15 @@ class InitializeFingers:
                  init_height_offset=0.0,
                  post_height_offset=0.0, 
                  finger_num=2,
-                 is_ood=False,):
+                 is_ood=False,
+                 consider_cloth=True, # consider cloth
+                 cloth_k=16,
+                 cloth_alphas=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9),
+                 cloth_margin_mult=1.0,
+                 cloth_dist_param=0.0,
+                 cloth_pen_param=1e8,
+                 cloth_weight=1.0,
+                 ):
         self.pose_id = pose_id
         self.verbose = verbose
         self.is_render = is_render
@@ -154,6 +271,15 @@ class InitializeFingers:
         self.object_com = None
         self.init_height_offset = init_height_offset
         self.post_height_offset = post_height_offset
+
+        # cloth-aware init (proxy constraint)
+        self.consider_cloth = consider_cloth
+        self.cloth_k = int(cloth_k)
+        self.cloth_alphas = tuple(float(a) for a in cloth_alphas)
+        self.cloth_margin_mult = float(cloth_margin_mult)
+        self.cloth_dist_param = float(cloth_dist_param)
+        self.cloth_pen_param = float(cloth_pen_param)
+        self.cloth_weight = float(cloth_weight)
         
         self.integrator = wp.sim.SemiImplicitIntegrator()
         self.build_rigid_model(object_rot)
@@ -170,7 +296,8 @@ class InitializeFingers:
         
         self.state0 = self.model.state(requires_grad=True)
         self.state1 = self.model.state(requires_grad=True)
-        self.total_dis = wp.array([0.0], dtype=wp.float32, requires_grad=True)
+        self.finger_dis = wp.zeros(1, dtype=wp.float32, requires_grad=True)
+        self.cloth_dis = wp.zeros(1, dtype=wp.float32, requires_grad=True)
         
         # things to optimize in torch
         self.transform_9d = wp.to_torch(self.transform_9d_wp, requires_grad=True)
@@ -220,6 +347,9 @@ class InitializeFingers:
         self.curr_finger_mesh = []
 
         # REQUIRE: soft_builder.finger_vertex_ranges / finger_face_ranges are populated
+
+        finger_vertices_np = []
+
         for i in range(self.finger_num):
             vs, ve = soft_builder.finger_vertex_ranges[i]
             fs, fe = soft_builder.finger_face_ranges[i]
@@ -227,9 +357,57 @@ class InitializeFingers:
             vertices_i = soft_builder.particle_q[vs:ve]
             faces_i    = soft_builder.tri_indices[fs:fe]
 
+            vertices_i_np = np.asarray(vertices_i, dtype=np.float32)
+            finger_vertices_np.append(vertices_i_np)
+
             finger_mesh.append(wp.sim.Mesh(vertices_i, faces_i))
             self.finger_mesh.append(wp.array(vertices_i, dtype=wp.vec3, requires_grad=True))
             self.curr_finger_mesh.append(wp.array(vertices_i, dtype=wp.vec3, requires_grad=True))
+
+        
+        # Cloth-aware init: build side IDs from real attachment edges
+        if self.consider_cloth:
+            self.cloth_left_ids = []
+            self.cloth_right_ids = []
+
+            # attachment count per edge is defined in TendonModelBuilder.add_finger()
+            # (num_attach_per_edge = 18 in your tendon_model.py)
+            # use that as cloth_k so buffers match perfectly
+            k_attach = len(soft_builder.finger_left_attach_ids[0])
+            self.cloth_k = k_attach
+
+            for i in range(self.finger_num):
+                vs, ve = soft_builder.finger_vertex_ranges[i]
+                n_local = ve - vs
+
+                left_global = np.asarray(soft_builder.finger_left_attach_ids[i], dtype=np.int32)
+                right_global = np.asarray(soft_builder.finger_right_attach_ids[i], dtype=np.int32)
+
+                left_local = left_global - vs
+                right_local = right_global - vs
+
+                # safety checks
+                assert left_local.min() >= 0 and left_local.max() < n_local, (i, left_local.min(), left_local.max(), n_local)
+                assert right_local.min() >= 0 and right_local.max() < n_local, (i, right_local.min(), right_local.max(), n_local)
+
+                self.cloth_left_ids.append(wp.array(left_local, dtype=wp.int32, requires_grad=False))
+                self.cloth_right_ids.append(wp.array(right_local, dtype=wp.int32, requires_grad=False))
+
+            # neighbour pairs, same as before
+            if self.finger_num == 2:
+                self.cloth_pairs = [(0, 1)]
+            else:
+                self.cloth_pairs = [(i, (i + 1) % self.finger_num) for i in range(self.finger_num)]
+
+        else:
+            # dummies so ForwardKinematics.apply always has something to pass
+            self.cloth_left_ids = []
+            self.cloth_right_ids = []
+            self.cloth_pairs = []
+            self.cloth_edge_a = wp.zeros(1, dtype=wp.vec3, requires_grad=True)
+            self.cloth_edge_b = wp.zeros(1, dtype=wp.vec3, requires_grad=True)
+            self.cloth_samples = wp.zeros(1, dtype=wp.vec3, requires_grad=True)
+
 
         # --- start assembling the rigid scene used for initialization ---
         self.builder = wp.sim.ModelBuilder()
@@ -250,6 +428,9 @@ class InitializeFingers:
             use_simple_mesh=False,
             is_fix=True,
         )
+        # NOTE: Don’t combine `is_fix=False` with an extra `add_joint_fixed(parent=-1, child=obj_body_id)` here.
+        # Together with the wrist free joint (also parent=-1), this creates multiple roots in the articulation,
+        # which messes with FK/dynamics (and gradients) and the finger-only optimisation stops converging.
 
         # create finger rigid bodies
         self.finger_body_idx = []
@@ -263,8 +444,9 @@ class InitializeFingers:
         self.builder.add_joint_free(parent=-1, child=wrist_body)
 
         # contact/thickness-based limits (same for all prismatic joints for now)
-        limit_low, limit_upp = 0.0 , 6 * finger_THK
+        limit_low, limit_upp = -6 * finger_THK , 6 * finger_THK # was 6 * finger_THK
         self.limit_low, self.limit_upp = limit_low, limit_upp
+        self.prismatic_limit = float(limit_upp) # store one number
 
         # add collision shapes for each finger
         self.finger_shape_ids = []
@@ -297,11 +479,154 @@ class InitializeFingers:
 
         # finalize and load initial pose
         self.model = self.builder.finalize(requires_grad=True)
+
+
+        shape_body = self.model.shape_body.numpy()          # shape -> body mapping
+        obj_shape_ids = np.where(shape_body == self.obj_body_id)[0]
+        assert len(obj_shape_ids) > 0, f"No shapes found for obj_body_id={self.obj_body_id}"
+
+        # if the object has multiple shapes, just pick the first for now
+        self.obj_shape_id = int(obj_shape_ids[0])
+
+        print("\nDEBUG ids:",
+            "obj_body_id=", self.obj_body_id,
+            "returned obj_geo_id=", self.obj_geo_id,
+            "computed obj_shape_id=", self.obj_shape_id,
+            "num_obj_shapes=", len(obj_shape_ids),"\n")
+
+
         self.init_circle_pose()
         #self.load_grasp_pose(self.pose_id)  # make sure this now sets 7 + finger_num DOFs
 
         # collision margin
         self.model.object_contact_margin = self.stop_margin * self.scale
+
+
+    def capture_proxy_points_frozen(self):
+        """
+        Capture EXACT proxy sample points (all pairs x all alphas x cloth_k points)
+        from the CURRENT curr_finger_mesh buffers.
+        Result is stored as self.proxy_pts_frozen (numpy float32, shape (M,3)).
+        """
+        if (not self.consider_cloth) or (len(self.cloth_pairs) == 0):
+            self.proxy_pts_frozen = None
+            return None
+
+        # Make sure curr_finger_mesh matches the *current* transform params
+        # (this runs one forward pass which updates curr_finger_mesh)
+        with torch.no_grad():
+            _ = self.forward(distance_param=1e-1, use_com=True)
+
+        pts = []
+        for (a, b) in self.cloth_pairs:
+            ids_a = self.cloth_left_ids[a].numpy().astype(np.int32)   # local ids into curr_finger_mesh[a]
+            ids_b = self.cloth_right_ids[b].numpy().astype(np.int32)  # local ids into curr_finger_mesh[b]
+
+            Pa = self.curr_finger_mesh[a].numpy()[ids_a]  # (k,3)
+            Pb = self.curr_finger_mesh[b].numpy()[ids_b]  # (k,3)
+
+            for alpha in self.cloth_alphas:
+                pts.append((1.0 - alpha) * Pa + alpha * Pb)
+
+        self.proxy_pts_frozen = np.vstack(pts).astype(np.float32)  # (M,3)
+        return self.proxy_pts_frozen
+
+
+    def sweep_R0(self, distance_param=1e-1, use_com=True):
+        """
+        Sweep a single shared radius value across all fingers.
+        span is fraction of limit_upp around the current init value.
+        """
+        with torch.no_grad():
+            span=0.6
+            num=11
+            r_init = float(self.transform_2d[0].item())
+
+            lo = max(-self.limit_upp, r_init - span * self.limit_upp)
+            hi = min(+self.limit_upp, r_init + span * self.limit_upp)
+            candidates = np.linspace(lo, hi, num, dtype=np.float32)
+
+            best_r = r_init
+            best_E = float("inf")
+
+            # keep a copy (in case you want to restore)
+            r_backup = self.transform_2d.clone()
+
+            for r in candidates:
+                self.transform_2d.fill_(float(r))
+
+                td = self.forward(distance_param=distance_param, use_com=use_com)
+                finger_E = float(td[0].item())
+                cloth_E  = float(td[1].item())
+
+                # match your normalisation in compute_loss()
+                if self.consider_cloth and len(self.cloth_pairs) > 0:
+                    cloth_E = cloth_E / (len(self.cloth_pairs) * len(self.cloth_alphas) * self.cloth_k)
+
+                E = finger_E + cloth_E
+
+                if E < best_E:
+                    best_E = E
+                    best_r = float(r)
+
+            # set best radius
+            self.transform_2d.copy_(r_backup)
+            self.transform_2d.fill_(best_r)
+
+            print(f"\n[R0 sweep] r_init={r_init:.6g} best_r={best_r:.6g} best_E={best_E:.6g}")
+
+
+    def debug_print_proxy_sdf(self, state_for_T=None, stride=10, max_points=2000):
+        if state_for_T is None:
+            state_for_T = self.state1
+
+        margin = float(self.model.object_contact_margin * self.cloth_margin_mult)
+        print(f"[debug sdf per pair] margin={margin:.6g}")
+
+        for pair_id, (a, b) in enumerate(self.cloth_pairs):
+            ids_a = self.cloth_left_ids[a].numpy().astype(np.int32)
+            ids_b = self.cloth_right_ids[b].numpy().astype(np.int32)
+
+            Pa = self.curr_finger_mesh[a].numpy()[ids_a]
+            Pb = self.curr_finger_mesh[b].numpy()[ids_b]
+
+            # collect all points for this pair
+            pts = []
+            for alpha in self.cloth_alphas:
+                pts.append((1.0 - alpha) * Pa + alpha * Pb)
+            pts = np.vstack(pts).astype(np.float32)
+
+            pts_wp = wp.array(pts, dtype=wp.vec3)
+            d_raw  = wp.zeros(len(pts), dtype=wp.float32)
+            near_c = wp.zeros(1, dtype=wp.int32)
+            neg_c  = wp.zeros(1, dtype=wp.int32)
+
+            wp.launch(
+                utils.debug_sdf_points,
+                dim=len(pts),
+                inputs=[
+                    self.model.shape_geo,
+                    int(self.obj_geo_id),
+                    self.model.shape_body,
+                    self.model.shape_transform,
+                    state_for_T.body_q,
+                    pts_wp,
+                    margin,
+                ],
+                outputs=[d_raw, near_c, neg_c],
+            )
+
+            dr = d_raw.numpy()
+            contact_margin = float(self.model.object_contact_margin)
+            n_contact = np.sum(dr < contact_margin)
+            print(f"  pair {pair_id} ({a}->{b}): min={dr.min():.6g} max={dr.max():.6g} near={int(near_c.numpy()[0])} neg={int(neg_c.numpy()[0])}", "contact<cm=", int(n_contact))
+
+            # print worst few for this pair
+            idx = np.argsort(np.abs(dr))[:3]
+            for j in idx:
+                print(f"     closest d_raw={dr[j]: .6g} p={pts[j]}")
+
+
 
     def init_circle_pose(self):
         # --- get object position from the model state ---
@@ -318,7 +643,7 @@ class InitializeFingers:
         R_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)  # x,y,z,w
 
         # initial radius (inside joint limits)
-        R0 = 0.2 * self.limit_upp  # e.g. 20% of max extension
+        R0 = -0.2* self.limit_upp  # e.g. 20% of max extension
         finger_init = [R0] * self.finger_num  # all same radius to start
 
         self.model.joint_q = wp.array(
@@ -372,9 +697,9 @@ class InitializeFingers:
 
         R_quat = utils.mat33_to_quat(R_gb)
         finger_init = []
-        for i in range(self.finger_num):
+        #for i in range(self.finger_num):
             # Example: left half negative, right half positive, or all zero, etc.
-            finger_init = [0.0] * self.finger_num
+        finger_init = [0.0] * self.finger_num
 
             # if i < self.finger_num // 2:
             #     finger_init.append(-self.limit_upp)
@@ -405,7 +730,9 @@ class InitializeFingers:
             self.curr_finger_mesh[i] = wp.array(self.finger_mesh[i].numpy(), dtype=wp.vec3, requires_grad=True)
         self.sim_time = 0.0
         self.render_time = 0.0
-        self.total_dis.zero_()
+
+        self.finger_dis.zero_()
+        self.cloth_dis.zero_()
 
         self.optimizer = torch.optim.SGD([
             {'params': self.transform_9d, 'lr': 1e-1, 'weight_decay': 1e-5},
@@ -414,6 +741,10 @@ class InitializeFingers:
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', patience=50, factor=0.05)
         
     def forward(self, distance_param, use_com):
+
+        self.finger_dis.zero_()
+        self.cloth_dis.zero_()
+
         total_dis_torch = ForwardKinematics.apply(
             self.transform_9d, 
             self.transform_2d,
@@ -427,11 +758,46 @@ class InitializeFingers:
             self.finger_body_idx,
             self.object_com,
             distance_param,
-            self.total_dis)
+            self.finger_dis,
+            self.cloth_dis,
+            self.obj_geo_id,
+            self.obj_body_id,
+            self.consider_cloth,
+            self.cloth_pairs,
+            self.cloth_left_ids,
+            self.cloth_right_ids,
+            self.cloth_alphas,
+            self.cloth_margin_mult,
+            self.cloth_dist_param,
+            self.cloth_pen_param,
+            self.cloth_weight,
+        )
         return total_dis_torch
 
     def compute_loss(self, total_dis_torch):
-        self.loss = torch.norm(total_dis_torch) ** 2.0
+
+        use_og_loss = False
+
+        if use_og_loss:
+            self.loss = torch.norm(total_dis_torch) ** 2.0
+            # self.loss = total_dis_torch[0].clone()
+        else:
+            finger_E = total_dis_torch[0]
+            cloth_E  = total_dis_torch[1]
+            
+            # normalise by sample counts so magnitudes are stable across finger_num / mesh resolution
+            # finger_E = finger_E / sum(len(m) for m in self.curr_finger_mesh) # breaks the finger only optimization
+
+            if self.consider_cloth and len(self.cloth_pairs) > 0:
+                cloth_E = cloth_E / (len(self.cloth_pairs) * len(self.cloth_alphas) * self.cloth_k)
+
+
+            # optional: store for logging
+            self.finger_E = finger_E.detach()
+            self.cloth_E  = cloth_E.detach()
+
+            self.loss = finger_E + cloth_E
+
 
     def step(self, iter, distance_param=1.0, use_com=False):
         def closure():
@@ -444,8 +810,8 @@ class InitializeFingers:
 
         self.optimizer.step(closure)
         with torch.no_grad():
-            for i in range(self.finger_num):
-                self.transform_2d.clamp_(self.limit_low, self.limit_upp)
+            #self.transform_2d.clamp_(-self.prismatic_limit, self.prismatic_limit)
+            # for i in range(self.finger_num):
                 # if i < self.finger_num // 2:
                 #     # “left side” − fingers should be negative
                 #     self.transform_2d[i].clamp_(-self.limit_upp, -self.limit_low)
@@ -459,13 +825,19 @@ class InitializeFingers:
             # print every e.g. 100 iters
             if iter % 10 == 0:
                 print(f"[iter {iter}] radius params (transform_2d): {current_radius}")
+                print(f"[iter {iter}] finger_E={self.finger_E.item():.6g} cloth_E={self.cloth_E.item():.6g}")
+
+                lr9  = self.optimizer.param_groups[0]["lr"]
+                lr2  = self.optimizer.param_groups[1]["lr"]
+                g2   = self.transform_2d.grad.detach().cpu().numpy().copy() if self.transform_2d.grad is not None else None
+                print(f"   lr2={lr2:.3e}, lr9={lr9:.3e}, grad2_norm={np.linalg.norm(g2) if g2 is not None else None}")
+
 
         if iter % 1000 == 0:
             print("iter:", iter, "loss:", self.loss)
 
         self.state0, self.state1 = self.state1, self.state0
         self.optimizer.zero_grad()
-        self.total_dis.zero_()
 
     def render(self):
         if self.renderer is None:
@@ -487,8 +859,11 @@ class InitializeFingers:
         patiance = 50
         stagnant_epochs = 0
 
-        distance_param = 1e-1
+        distance_param = 0.0 # was 1e-1
         use_com = True
+
+        # NEW: sweep initial radius
+        self.sweep_R0(distance_param=distance_param, use_com=use_com)
 
         for i in range(self.train_iter):
 
@@ -503,7 +878,7 @@ class InitializeFingers:
             elif np.abs(self.loss.item() - prev_loss) < loss_diff_threshold:
                 stagnant_epochs += 1
                 if stagnant_epochs > patiance:
-                    print("Converged at iteration:", i, "loss:", self.loss)
+                    print("Converged (stagnation) at iteration:", i, "loss:", self.loss)
                     break
             else:
                 stagnant_epochs = 0
@@ -527,6 +902,11 @@ class InitializeFingers:
                 wp.quat(body_q[3], body_q[4], body_q[5], body_q[6])))
          
         init_trans = [wp.transform_multiply(body_trans[i], self.init_transforms[i]) for i in range(self.finger_num)]
+
+        self.debug_print_proxy_sdf(state_for_T=self.state1, stride=10)
+
+        # after convergence / before return
+        self.capture_proxy_points_frozen() # for viz of cloth proxy points
         
         return init_trans, jq
     

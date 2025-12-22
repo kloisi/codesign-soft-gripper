@@ -39,7 +39,7 @@ class ObjectLoader:
                 pos: np.array, rot: wp.quat, 
                 scale: float, 
                 # contact stiffness 
-                ke=1.0e3, kd=1.0e1,
+                ke=1.0e9, kd=1.0e1, # increased fither since I otherwise high rirsk of penetrating coral branch
                 # stiffness test v4,5:    ke=1.0e3, kd=1.0e1,
                 # stiffness test v3:    ke=1.0e6, kd=5.0e1,
                 # default was           ke=1.0e-5, kd=1.0e-1,
@@ -113,5 +113,14 @@ class ObjectLoader:
             kf=kf,
             mu=mu,
         )
-        # print(f"Added {self.obj_name} to the scene")
+        print("\nDEBUGS FROM object_loader.py:")
+        print(f"Added {self.obj_name} to the scene")
+        print("watertight:", obj_mesh.is_watertight)
+        print("euler:", obj_mesh.euler_number)
+        print("volume:", getattr(obj_mesh, "volume", None))
+        print("tris:", len(obj_mesh.faces))
+        print("bounds:", obj_mesh.bounds)
+        print("extents:", obj_mesh.extents)
+        print("com:", obj_mesh.center_mass, "\n")
+
         return object_com, b, geo_id
