@@ -569,7 +569,7 @@ class TendonModelBuilder(ModelBuilder):
 
         # --- Cloth connecting between fingers ---
         # build welded membrane between the *edges* of the two fingers
-        # here: right edge of finger 0 -> left edge of finger 1
+        # here: left edge of finger 0 -> right edge of finger 1
         if add_connecting_cloth:
             for i in range(self.finger_num):
                 j = (i + 1) % self.finger_num
@@ -579,10 +579,10 @@ class TendonModelBuilder(ModelBuilder):
                     edge_a="left",
                     edge_b="right",
                     dx_nominal=cell_size[0],
-                    mass_per_vertex=1e-3,
-                    tri_ke=1.0e2,
-                    tri_ka=1.0e2,
-                    tri_kd=1.0e1,
+                    mass_per_vertex=1e-4, # for 18x18 cloth: 18*18*0.0001 = 0.0324 = 30g
+                    tri_ke=1.0e1,
+                    tri_ka=1.0e1,
+                    tri_kd=1.0e0,
                 )
 
 
@@ -647,6 +647,7 @@ class TendonModelBuilder(ModelBuilder):
                 
         return finger_transforms, finger_LEN, finger_THK
  
+
     def add_finger(self, 
                    cell_dim, cell_size, conn_dim, conn_size, 
                    transform=None,
@@ -907,17 +908,15 @@ class TendonModelBuilder(ModelBuilder):
         self,
         finger_a: int = 0,
         finger_b: int = 1,
-        edge_a: str = "right",
-        edge_b: str = "left",
+        edge_a: str = "left",
+        edge_b: str = "right",
         dx_nominal: float | None = None,
-        span_subdiv: int | None = None,   # if set, overrides dx-based auto selection
         mass_per_vertex: float = 1e-3,
         tri_ke: float = 1.0e2,
         tri_ka: float = 1.0e2,
         tri_kd: float = 1.0e1,
         tri_drag: float = 0.0,
         tri_lift: float = 0.0,
-        max_span_subdiv: int = 32,
     ):
         """
         MW_ADDED
@@ -928,14 +927,6 @@ class TendonModelBuilder(ModelBuilder):
         - Creates additional interior cloth vertices between the fingers.
         - Adds triangles to form a rectangular cloth patch.
         - Stores particle indices in self.attached_cloth_ids. Interior vertices are treated as cloth
-
-        Resolution across the gap is chosen as:
-        - If span_subdiv is not None:
-            use it directly (clamped to [1, max_span_subdiv]).
-        - Else if dx_nominal is not None:
-            use dx_nominal as target spacing across the gap.
-        - Else:
-            estimate dx from the actual attachment points along the finger.
         """
 
         # basic safety checks
@@ -968,37 +959,17 @@ class TendonModelBuilder(ModelBuilder):
         Pb = np.array([self.particle_q[i] for i in ids_b], dtype=float)
 
         # Choose span_subdiv (number of interior segments across gap)
-        if span_subdiv is None:
-            # spacing along the finger
-            # - if dx_nominal is given: use that
-            # - otherwise: measure from attachments
-            dx_measured = None
-            diffs = np.linalg.norm(Pa[1:] - Pa[:-1], axis=1)
-            diffs = diffs[diffs > 1e-6]
-            if diffs.size > 0:
-                dx_measured = float(np.mean(diffs))
+        max_span_subdiv = 32
 
-            if dx_nominal is not None:
-                dx = float(dx_nominal)
-                # if you ever want to compare:
-                # print("dx_nominal:", dx, "dx_measured:", dx_measured)
-            else:
-                dx = dx_measured
+        dx = float(dx_nominal)
 
-            # average gap between the two fingers
-            D = float(np.mean(np.linalg.norm(Pb - Pa, axis=1)))
+        # average gap between the two fingers
+        D = float(np.mean(np.linalg.norm(Pb - Pa, axis=1)))
 
-            if dx is not None and dx > 1e-6:
-                # isotropic-ish spacing: D / (span_subdiv + 1) ~ dx
-                est = D / dx
-                span_subdiv_est = int(round(est)) - 1
-                span_subdiv = max(1, min(max_span_subdiv, span_subdiv_est))
-            else:
-                # fallback: reasonable default
-                span_subdiv = 4
-        else:
-            # user (or caller) specified span_subdiv explicitly
-            span_subdiv = max(1, min(max_span_subdiv, int(span_subdiv)))
+        # isotropic-ish spacing: D / (span_subdiv + 1) ~ dx
+        est = D / dx
+        span_subdiv_est = int(round(est)) - 1
+        span_subdiv = max(1, min(max_span_subdiv, span_subdiv_est))
 
         # Ensure all boundary vertices are wp.vec3 (add_triangle expects this)
         boundary_ids = np.unique(np.concatenate([ids_a, ids_b])).astype(np.int32)
@@ -1084,7 +1055,7 @@ class TendonModelBuilder(ModelBuilder):
     def select_cloth_finger_attachment_ids(
         self,
         finger_index: int,
-        which: str = "spine", # "spine", "edges"
+        which: str = "spine", # "edge_lo", "edge_hi"
         num_attach: int = 18,
     ):
         """
@@ -1190,9 +1161,6 @@ class TendonModelBuilder(ModelBuilder):
 
         if which == "spine":
             ids = spine_ids
-        elif which == "edges":
-            # both edges together
-            ids = np.concatenate([edge_ids_lo, edge_ids_hi])
         elif which == "edge_lo":
             # one edge only (z-min side in local coords)
             ids = edge_ids_lo

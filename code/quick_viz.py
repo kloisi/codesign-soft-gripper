@@ -79,7 +79,9 @@ def quick_visualize(tendon,
                     save_path=None,
                     elev=30,
                     azim=45,
-                    point_size=6):
+                    point_size=6,
+                    show_proxy=True,
+                    proxy_alphas=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)):
     """
     Standalone quick viz for FEMTendon.
     """
@@ -110,14 +112,24 @@ def quick_visualize(tendon,
     obj_local = getattr(tendon, "obj_local_pts", None)
     n_obj = 0 if obj_local is None else len(obj_local)
 
+
+    proxy_pts = getattr(tendon, "proxy_pts_frozen", None)
+    if proxy_pts is not None and False:
+        proxy_pts = np.asarray(proxy_pts, dtype=np.float32)
+        n_proxy = proxy_pts.shape[0]
+    else:
+        n_proxy = 0
+
+
     # base colours
     finger_color = np.array([0.2, 0.8, 0.2])  # green
     cloth_color  = np.array([0.9, 0.4, 0.1])  # orange
     obj_color    = np.array([0.2, 0.3, 1.0])  # blue
+    proxy_color = np.array([0.6, 0.2, 0.9])  # purple
 
     n_f = len(finger_ids)
     n_c = len(cloth_ids)
-    N = n_f + n_c + n_obj
+    N = n_f + n_c + n_obj + n_proxy
 
     if N == 0:
         print("quick viz: nothing to plot (no particles and no object points)")
@@ -128,7 +140,9 @@ def quick_visualize(tendon,
     if n_c > 0:
         colors[n_f:n_f+n_c] = cloth_color
     if n_obj > 0:
-        colors[n_f+n_c:] = obj_color
+        colors[n_f+n_c:n_f+n_c+n_obj] = obj_color
+    if n_proxy > 0:
+        colors[n_f+n_c+n_obj:] = proxy_color
 
 
     # --- highlight back-of-finger verts yellow ---
@@ -215,6 +229,11 @@ def quick_visualize(tendon,
             rotm = R.from_quat(quat).as_matrix()
             obj_world = (obj_local @ rotm.T) + pos
             P_list.append(obj_world.astype(np.float32))
+
+        if n_proxy > 0:
+            P_list.append(proxy_pts)  # frozen, identical every frame
+
+
 
         P = np.vstack(P_list)
         pcs.append(P.astype(np.float32))
