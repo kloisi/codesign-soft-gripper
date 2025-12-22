@@ -395,13 +395,14 @@ def transform_to9d(trans: wp.array(dtype=wp.float32), # 7d
 @wp.kernel
 def multi_transform_to11d(trans: wp.array(dtype=wp.float32), # 9d
                           joints_per_env: int, 
+                          finger_num: wp.int32,
                           transform_9d: wp.array(dtype=wp.float32),
                           transform_2d: wp.array(dtype=wp.float32),
 ):
     tid = wp.tid()
     env_offset = tid * joints_per_env
     offset_9d = tid * 9 
-    offset_2d = tid * 2
+    offset_2d = tid * finger_num
     # translation
     for i in range(3):
         transform_9d[offset_9d + i] = trans[env_offset + i]
@@ -409,12 +410,15 @@ def multi_transform_to11d(trans: wp.array(dtype=wp.float32), # 9d
     # rotation
     quat = wp.quaternion(trans[env_offset + 3], trans[env_offset + 4], trans[env_offset + 5], trans[env_offset + 6])
     R = wp.quat_to_matrix(quat) # R_{2 x 3}
-    for i in range(6):
-        transform_9d[offset_9d + i + 3] = R[i // 3, i % 3]
+    # for i in range(6):
+        # transform_9d[offset_9d + i + 3] = R[i // 3, i % 3]
+    # ADDED
+    transform_9d[offset_9d + 3] = R[0,0]; transform_9d[offset_9d + 4] = R[1,0]; transform_9d[offset_9d + 5] = R[2,0]
+    transform_9d[offset_9d + 6] = R[0,1]; transform_9d[offset_9d + 7] = R[1,1]; transform_9d[offset_9d + 8] = R[2,1]
         
     # prismatic joint
     N = transform_2d.shape[0]
-    for i in range(N):
+    for i in range(finger_num):
         transform_2d[offset_2d + i] = trans[env_offset + i + 7]
 
 @wp.kernel
@@ -430,12 +434,13 @@ def transform_from9d(transform_9d: wp.array(dtype=float),
 @wp.kernel
 def multi_transform_from11d(transform_9d: wp.array(dtype=float),
                             transform_2d: wp.array(dtype=float),
+                            finger_num: wp.int32,
                             joints_per_env: int,
                             trans: wp.array(dtype=float)):
     tid = wp.tid() 
     env_offset = tid * joints_per_env
     offset_9d = tid * 9 
-    offset_2d = tid * 2
+    offset_2d = tid * finger_num
     
     # get transform from 9d
     a1 = wp.vec3(transform_9d[offset_9d + 3], transform_9d[offset_9d + 4], transform_9d[offset_9d + 5])
@@ -444,8 +449,9 @@ def multi_transform_from11d(transform_9d: wp.array(dtype=float),
     b2 = a2 - (wp.dot(b1, a2) * b1)
     b2_norm = wp.normalize(b2)
     b3 = wp.cross(b1, b2_norm)
-    R_t = wp.mat33(b1, b2_norm, b3)
-    R = wp.transpose(R_t)
+    # R_t = wp.mat33(b1, b2_norm, b3)
+    # R = wp.transpose(R_t)
+    R = wp.matrix_from_cols(b1, b2_norm, b3)
     trans_q = wp.quat_from_matrix(R)
     T = wp.transform(
         wp.vec3(transform_9d[offset_9d + 0], transform_9d[offset_9d + 1], transform_9d[offset_9d + 2]),
@@ -457,7 +463,7 @@ def multi_transform_from11d(transform_9d: wp.array(dtype=float),
     for i in range(4):
         trans[env_offset + i + 3] = q[i]
     N = transform_2d.shape[0]
-    for i in range(N):
+    for i in range(finger_num):
         trans[env_offset + i + 7] = transform_2d[offset_2d + i]
         
 @wp.func
@@ -468,13 +474,11 @@ def transform_from9d_func(transform_9d: wp.array(dtype=float)):
     b2 = a2 - (wp.dot(b1, a2) * b1)
     b2_norm = wp.normalize(b2)
     b3 = wp.cross(b1, b2_norm)
-    R_t = wp.mat33(b1, b2_norm, b3)
-    R = wp.transpose(R_t)
-    trans_q = wp.quat_from_matrix(R)
-    T = wp.transform(
-        wp.vec3(transform_9d[0], transform_9d[1], transform_9d[2]),
-        trans_q)
-    return T
+
+    # build rotation with columns b1,b2,b3 (no transpose)
+    R = wp.mat33(b1, b2_norm, b3)
+    return wp.transform(wp.vec3(transform_9d[0], transform_9d[1], transform_9d[2]), wp.quat_from_matrix(R))
+
 
 @wp.kernel
 def transform_matrix_from9d(transform_9d: wp.array(dtype=float),
@@ -581,8 +585,11 @@ def transform_to11d(trans: wp.array(dtype=wp.float32), # 9d
     # rotation
     quat = wp.quaternion(trans[3], trans[4], trans[5], trans[6])
     R = wp.quat_to_matrix(quat) # R_{2 x 3}
-    for i in range(6):
-        transform_9d[i + 3] = R[i // 3, i % 3]
+    #for i in range(6):
+        # transform_9d[i + 3] = R[i // 3, i % 3]
+    # ADDED store first two columns (col0 then col1)
+    transform_9d[3] = R[0,0]; transform_9d[4] = R[1,0]; transform_9d[5] = R[2,0]
+    transform_9d[6] = R[0,1]; transform_9d[7] = R[1,1]; transform_9d[8] = R[2,1]
         
     # prismatic joint
     N = transform_2d.shape[0] 
@@ -713,7 +720,9 @@ def finger_com(vertices: wp.array(dtype=wp.vec3),
 @wp.kernel
 def mesh_dis(geo: ModelShapeGeometry,
              object_id: wp.int32,
-             object_body_id: wp.int32,
+             #object_body_id: wp.int32,
+             shape_body: wp.array(dtype=wp.int32), # ADDED:
+             shape_transform: wp.array(dtype=wp.transform), # ADDED:
              body_q: wp.array(dtype=wp.transform),
              finger_mesh: wp.array(dtype=wp.vec3),
              collision_dis: float,
@@ -725,8 +734,11 @@ def mesh_dis(geo: ModelShapeGeometry,
     max_dis = 100.0
 
     finger_pt = finger_mesh[tid]
-    object_trans = body_q[object_body_id]
-    finger_local = wp.transform_point(wp.transform_inverse(object_trans), finger_pt)
+
+    # ADDED: robust shape transform (works for static shapes where body_id == -1)
+    shape_T = shape_world_transform(object_id, shape_body, shape_transform, body_q)
+    finger_local = wp.transform_point(wp.transform_inverse(shape_T), finger_pt)
+
     mesh_b = geo.source[object_id]
     geo_scale_b = geo.scale[object_id]
 
@@ -736,7 +748,7 @@ def mesh_dis(geo: ModelShapeGeometry,
     penalty = d*d * distance_param
     # penalty = 0.0
     if d < 0.0:
-        penalty = d*d * penetration_param# Quadratic force to enforce boundary
+        penalty = d*d * penetration_param  # Quadratic force to enforce boundary
         # wp.printf("collision detected: %f, dis:%f\n", d, collision_dis)
     
     # penalize ground collision
@@ -747,6 +759,113 @@ def mesh_dis(geo: ModelShapeGeometry,
         # penalty += penetration_param * finger_pt[1]*finger_pt[1]
         penalty += d*d * penetration_param
     wp.atomic_add(total_dis, frame, penalty)
+
+
+
+# MW_ADDED:
+@wp.kernel
+def cloth_proxy_barrier_pair(
+    geo: ModelShapeGeometry,
+    shape_id: wp.int32,
+    shape_body: wp.array(dtype=wp.int32),
+    shape_transform: wp.array(dtype=wp.transform),
+    body_q: wp.array(dtype=wp.transform),
+
+    verts_a: wp.array(dtype=wp.vec3),
+    ids_a: wp.array(dtype=wp.int32),
+    verts_b: wp.array(dtype=wp.vec3),
+    ids_b: wp.array(dtype=wp.int32),
+
+    alpha: wp.float32,
+    margin: wp.float32,
+    beta: wp.float32,
+
+    w_far: wp.float32,
+    w_pen: wp.float32,
+
+    d_target: wp.float32,
+
+    out: wp.array(dtype=wp.float32),
+):
+    tid = wp.tid()
+
+    pa = verts_a[ids_a[tid]]
+    pb = verts_b[ids_b[tid]]
+    p_world = (1.0 - alpha) * pa + alpha * pb
+
+    T = shape_world_transform(shape_id, shape_body, shape_transform, body_q)
+    p_local = wp.transform_point(wp.transform_inverse(T), p_world)
+
+    mesh_b = geo.source[shape_id]
+    s      = geo.scale[shape_id]
+    max_dis = 100.0
+
+    # d = mesh_sdf(mesh_b, wp.cw_div(p_local, s), max_dis) - margin
+    d_raw = mesh_sdf(mesh_b, wp.cw_div(p_local, s), max_dis)
+    d = wp.abs(d_raw) - margin        # distance to surface minus margin
+    v_pen = softplus(-d, beta)        # penalise penetration if closer than margin
+
+    v_far = softplus(d - d_target, beta)  # too far
+
+    #wp.atomic_add(out, 0, w_pen*v_pen*v_pen + w_far*v_far*v_far)
+    pen = wp.max(0.0, margin - d_raw)
+    far = wp.max(0.0, d_raw - d_target)   # too far outside
+    wp.atomic_add(out, 0, w_pen * pen * pen + w_far * far * far)
+
+
+# MW_ADDED:
+@wp.func
+def shape_world_transform(
+    shape_id: wp.int32,
+    shape_body: wp.array(dtype=wp.int32),
+    shape_transform: wp.array(dtype=wp.transform),
+    body_q: wp.array(dtype=wp.transform),
+):
+    b = shape_body[shape_id]
+    T = shape_transform[shape_id]
+    if b >= 0:
+        T = wp.transform_multiply(body_q[b], T)
+    return T
+
+
+# MW_ADDED:
+@wp.kernel
+def debug_sdf_points(
+    geo: ModelShapeGeometry,
+    shape_id: wp.int32,
+    shape_body: wp.array(dtype=wp.int32),
+    shape_transform: wp.array(dtype=wp.transform),
+    body_q: wp.array(dtype=wp.transform),
+
+    pts_world: wp.array(dtype=wp.vec3),
+    margin: wp.float32,
+
+    d_raw_out: wp.array(dtype=wp.float32),
+    near_out: wp.array(dtype=wp.int32),
+    neg_out: wp.array(dtype=wp.int32),
+):
+    tid = wp.tid()
+
+    p_world = pts_world[tid]
+
+    T = shape_world_transform(shape_id, shape_body, shape_transform, body_q)
+    p_local = wp.transform_point(wp.transform_inverse(T), p_world)
+
+    mesh_b = geo.source[shape_id]
+    s      = geo.scale[shape_id]
+    max_dis = 100.0
+
+    d_raw = mesh_sdf(mesh_b, wp.cw_div(p_local, s), max_dis)
+
+    d_raw_out[tid] = d_raw
+
+    if wp.abs(d_raw) < margin:
+        wp.atomic_add(near_out, 0, 1)
+
+    if d_raw < 0.0:
+        wp.atomic_add(neg_out, 0, 1)
+
+
 
 @wp.kernel
 def joint_grip(joint_q:wp.array(dtype=float),

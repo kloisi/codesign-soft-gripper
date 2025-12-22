@@ -71,7 +71,8 @@ class FEMTendon:
                  object_density=1e1,
                  finger_len=9, finger_rot=np.pi/9, finger_width=0.08, scale=4.0, finger_transform=None,
                  finger_num=2,
-                 init_finger=None):
+                 init_finger=None,
+                 no_cloth=False):
         self.verbose = verbose
         self.save_log = save_log
         fps = 4000
@@ -99,7 +100,8 @@ class FEMTendon:
         self.object_density = object_density
         self.has_object = bool(self.ycb_object_name)
 
-
+        self.no_cloth = bool(no_cloth)
+        
         self.curr_dir = os.path.dirname(os.path.realpath(__file__))
         self.stage_path = self.curr_dir + "/../output/" + stage_path + f"{ycb_object_name}_{log_prefix}_frame{num_frames}" + ".usd"
 
@@ -116,23 +118,18 @@ class FEMTendon:
                           obj_rot=object_rot,
                           scale=self.scale,
                           use_simple_mesh=False,
-                          is_fix=False,
+                          is_fix=True,
                           density=object_density,
                           )
         self.builder.init_builder_tendon_variables(self.finger_num, self.finger_len, self.scale, self.requires_grad)
 
-        if not args.no_cloth:
-            is_cloth=True
-        else:
-            is_cloth=False
-            
         self.builder.build_fem_model(
             finger_width=self.finger_width,
             finger_rot=self.finger_rot,
             obj_loader=self.obj_loader,
             finger_transform=self.finger_transform,
             is_triangle=True,
-            add_connecting_cloth=is_cloth,
+            add_connecting_cloth= not self.no_cloth,
             add_drop_cloth=False, # add cloth for dropping test
             )
         self.model = self.builder.model
@@ -144,7 +141,7 @@ class FEMTendon:
             verts = np.asarray(self.obj_loader.mesh.vertices, dtype=np.float32)
             verts = verts - verts.mean(axis=0, keepdims=True)   # same centering as shift_vs
             verts = verts * self.scale                          # same scaling as Warp shape
-            verts = verts[::10]                                 # subsample for speed
+            verts = verts[::2]                                 # subsample for speed
             self.obj_local_pts = verts
 
 
@@ -182,6 +179,7 @@ class FEMTendon:
         self.log_K_list = []
         self.save_list = []
         self.mass_list = []
+        self.density_list = [] # EDITED: was missing for some reason, but idk if it matters
         self.run_name = f"{time.strftime('%Y-%m-%d_%H-%M-%S')}"
         self.file_name = self.save_dir + f"{self.run_name}.npz"
 
@@ -272,7 +270,7 @@ class FEMTendon:
                 index = i + frame * self.sim_substeps
                 self.states[index].clear_forces()
                 self.tendon_holder.reset()
-                if i % 20 == 0:
+                if i % 1 == 0: # default was % 20, (computing collisions every 20 substeps)
                     wp.sim.collide(self.model, self.states[index])
                 
                 self.control.update_target_vel(frame)
@@ -285,6 +283,7 @@ class FEMTendon:
                 self.object_body_f = self.states[index].body_f
 
         self.object_q = self.states[-1].body_q
+        self.object_body_f = self.states[-1].body_f # body force from last state after integration
     
     def simulate(self):
         # sample random stiffness
@@ -477,9 +476,15 @@ if __name__ == "__main__":
                 is_triangle=False,
                 finger_num=args.finger_num,
                 add_random=args.random,
+                consider_cloth=not args.no_cloth,
             )
 
             finger_transform, init_finger_q = init_finger.get_initial_position()
+
+            # freeze init_pose proxy points and attach to FEM sim for viz
+            if init_finger is not None:
+                init_finger.capture_proxy_points_frozen()
+
 
             # if optimisation fails, fall back gracefully
             if finger_transform is None:
@@ -509,8 +514,11 @@ if __name__ == "__main__":
             scale=scale,
             finger_transform=finger_transform,
             finger_num=args.finger_num,
-            init_finger=init_finger)
+            init_finger=init_finger,
+            no_cloth=args.no_cloth)
 
+        if init_finger is not None and getattr(init_finger, "proxy_pts_frozen", None) is not None:
+            tendon.proxy_pts_frozen = init_finger.proxy_pts_frozen
 
 
         tendon.forward()
