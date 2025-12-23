@@ -39,9 +39,8 @@ class ObjectLoader:
                 pos: np.array, rot: wp.quat, 
                 scale: float, 
                 # contact stiffness 
-                ke=1.0e9, kd=1.0e1, # increased fither since I otherwise high rirsk of penetrating coral branch
-                # stiffness test v4,5:    ke=1.0e3, kd=1.0e1,
-                # stiffness test v3:    ke=1.0e6, kd=5.0e1,
+                ke=1.0e9, kd=1.0e1, # increased futher since otherwise high rirsk of penetrating coral branch
+                # Stiffer contact makes the system numerically stiff, but with current dt it seems fine
                 # default was           ke=1.0e-5, kd=1.0e-1,
                 kf=1e1, mu=1.0,
                 obj_name='006_mustard_bottle',
@@ -116,11 +115,11 @@ class ObjectLoader:
         print("\nDEBUGS FROM object_loader.py:")
         print(f"Added {self.obj_name} to the scene")
         print("watertight:", obj_mesh.is_watertight)
-        print("euler:", obj_mesh.euler_number)
-        print("volume:", getattr(obj_mesh, "volume", None))
-        print("tris:", len(obj_mesh.faces))
-        print("bounds:", obj_mesh.bounds)
-        print("extents:", obj_mesh.extents)
-        print("com:", obj_mesh.center_mass, "\n")
+        # print("euler (number of 'handles'):", obj_mesh.euler_number) # χ=V−E+F, V is number of vertices, E edges, F faces, for a sphere χ=0, torus χ=1, 2 -> 2handles, ...
+        # print("volume:", getattr(obj_mesh, "volume", None))
+        # print("tris:", len(obj_mesh.faces))
+        # print("bounds:", obj_mesh.bounds)
+        # print("extents:", obj_mesh.extents)
+        # print("com:", obj_mesh.center_mass, "\n")
 
         return object_com, b, geo_id

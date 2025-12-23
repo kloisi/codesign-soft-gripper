@@ -107,7 +107,7 @@ class FEMTendon:
         self.no_cloth = bool(no_cloth)
         
         self.curr_dir = os.path.dirname(os.path.realpath(__file__))
-        self.stage_path = self.curr_dir + "/../output/" + stage_path + f"{ycb_object_name}_{log_prefix}_frame{num_frames}" + ".usd"
+        self.stage_path = self.curr_dir + "/../output/" + stage_path + "_" + f"{ycb_object_name}_{log_prefix}_frame{num_frames}" + ".usd"
 
         save_dir = self.curr_dir + "/../data_gen/" + f"{ycb_object_name}_frame{num_frames}/rand/"
         if save_log and (not os.path.exists(save_dir)):

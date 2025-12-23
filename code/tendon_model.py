@@ -523,6 +523,12 @@ class TendonModelBuilder(ModelBuilder):
 
             yaw = theta + math.pi
             rot = wp.quat_rpy(yaw, 0.0, -math.pi/2)
+
+            # shift so the finger center (z = finger_height/2) lies on the circle
+            local_center_offset = wp.vec3(0.0, 0.0, 0.5 * finger_height)
+            world_center_offset = wp.quat_rotate(rot, local_center_offset)
+            pos = wp.vec3(x, plane_y, z) - world_center_offset
+
             return wp.transform(pos, rot)
 
         # if a list of transforms was passed in, use it; otherwise generate
