@@ -102,6 +102,9 @@ class ForwardKinematics(torch.autograd.Function):
             # Copy FK poses to state_out so the rest of the code stays unchanged
             ctx.state_out.body_q = wp.clone(ctx.state_in.body_q)
 
+            finger_dist_param = 1e-1
+            finger_pen_param = 1e3
+
             for i in range(len(curr_finger_mesh)):
                 wp.launch(utils.transform_points_out,
                         dim=len(ctx.curr_finger_mesh[i]),
@@ -120,8 +123,8 @@ class ForwardKinematics(torch.autograd.Function):
                                 ctx.curr_finger_mesh[i],
                                 # ctx.model.rigid_contact_margin*1.0,
                                 ctx.model.object_contact_margin*1.0,
-                                1e-1,
-                                1e3, 0],
+                                finger_dist_param, finger_pen_param,
+                                0],
                         outputs=[ctx.finger_dis])
 
             
@@ -132,7 +135,7 @@ class ForwardKinematics(torch.autograd.Function):
                 margin = ctx.model.object_contact_margin * ctx.cloth_margin_mult
                 beta = 50.0
                 d_target = margin   # has no visible effect (compared 0.3 to 1000)
-                cloth_dist_param = 0.0
+                cloth_dist_param = 1e-3
                 cloth_pen_param = 1e8
 
                 for (a, b) in ctx.cloth_pairs:
@@ -168,7 +171,7 @@ class ForwardKinematics(torch.autograd.Function):
     
     @staticmethod
     def backward(ctx, adj_total_dis):
-        max_grad_trans = 1.0
+        max_grad_trans = 5.0
         max_grad_rot = 1e-8
 
         # seed output grads (shape (1,) each)
@@ -819,7 +822,7 @@ class InitializeFingers:
             self.iter_history.append(iter)
 
             # log to console
-            if iter % 10 == 0:
+            if self.verbose and iter % 10 == 0 or iter % 100 == 0:
                 r = current_radius
                 lr9  = self.optimizer.param_groups[0]["lr"]
                 lr2  = self.optimizer.param_groups[1]["lr"]
@@ -905,7 +908,7 @@ class InitializeFingers:
     
     def get_initial_position(self, init_trans=None):
         prev_loss = 1e10
-        convergence_threshold = 1e-5
+        convergence_threshold = 1e-3
         loss_diff_threshold = 1e-8
         patiance = 50
         stagnant_epochs = 0
