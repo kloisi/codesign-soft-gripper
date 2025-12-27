@@ -112,9 +112,9 @@ class ObjectLoader:
             kf=kf,
             mu=mu,
         )
-        print("\nDEBUGS FROM object_loader.py:")
-        print(f"Added {self.obj_name} to the scene")
-        print("watertight:", obj_mesh.is_watertight)
+        #print("\nDEBUGS FROM object_loader.py:")
+        #print(f"Added {self.obj_name} to the scene")
+        #print("watertight:", obj_mesh.is_watertight)
         # print("euler (number of 'handles'):", obj_mesh.euler_number) # χ=V−E+F, V is number of vertices, E edges, F faces, for a sphere χ=0, torus χ=1, 2 -> 2handles, ...
         # print("volume:", getattr(obj_mesh, "volume", None))
         # print("tris:", len(obj_mesh.faces))

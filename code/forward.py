@@ -533,31 +533,37 @@ class FEMTendon:
         print(f"--- Done. Final Forces: {forces_param.detach().cpu().numpy()} ---")
         return history
 
-    def optimize_forces_adam(self, iterations=10, learning_rate=10.0, opt_frames=10):
-        print(f"--- Optimizing Forces (Numerical + Adam) ---")
+    def optimize_forces_adam(self, iterations=20, learning_rate=0.1, opt_frames=10):
+        print(f"--- Optimizing Forces (Robust Numerical + Adam) ---")
         
-        # Configuration
-        epsilon = 15.0 
+        max_force = 100.0
+        delta_force = 1.0  # Perturb by 1N for accurate local gradient
         
-        # 1. Setup Tensor
-        forces_param = torch.tensor(self.tendon_forces.numpy(), dtype=torch.float32, device='cuda', requires_grad=True)
-        num_tendons = len(forces_param)
+        # 1. Setup Latent Parameters (Unbounded Log-Odds)
+        # We optimize 'latents' instead of 'forces' directly for stability.
+        # This allows Adam to push values freely without hitting hard '0' or '100' walls.
+        start_vals = self.tendon_forces.numpy() / max_force
+        start_vals = np.clip(start_vals, 0.01, 0.99)
+        start_latents = np.log(start_vals / (1.0 - start_vals))
         
-        # 2. Initialize Adam
-        optimizer = torch.optim.Adam([forces_param], lr=learning_rate)
+        latents_param = torch.tensor(start_latents, dtype=torch.float32, device='cuda', requires_grad=True)
+        num_tendons = len(latents_param)
         
-        # History tracker
-        history = {
-            "loss": [],
-            "forces": []
-        }
+        # 2. Adam Optimizer (Standard LR is 0.1 for latent variables)
+        optimizer = torch.optim.Adam([latents_param], lr=learning_rate)
+        
+        history = {"loss": [], "forces": []}
         
         for iter_idx in range(iterations):
             optimizer.zero_grad()
             
-            # Step A: Base Run
-            forces_np = forces_param.detach().cpu().numpy()
+            # --- Forward Pass ---
+            # Convert Latent -> Force (Sigmoid)
+            current_forces_pct = torch.sigmoid(latents_param)
+            current_forces = max_force * current_forces_pct
+            forces_np = current_forces.detach().cpu().numpy()
             
+            # Calculate Base Loss
             loss_base = FEMForceOptimization.run(
                 torch.tensor(forces_np, device='cuda'), 
                 self.model, self.states, self.integrator, self.sim_dt, 
@@ -565,74 +571,80 @@ class FEMTendon:
                 opt_frames, self.builder.finger_vertex_ranges
             )
             
-            print(f"Iter {iter_idx}: Base Loss {loss_base:.4f}")
-            
-            # Log Data
             history["loss"].append(float(loss_base))
             history["forces"].append(forces_np.tolist())
-
-            # Step B: Calculate Gradients (Numerical)
-            grads_buffer = np.zeros(num_tendons, dtype=np.float32)
+            
+            # --- Gradient Calculation (Chain Rule) ---
+            # 1. dLoss / dForce (Numerical Finite Difference)
+            grads_wrt_force = np.zeros(num_tendons, dtype=np.float32)
             
             for t in range(num_tendons):
-                test_forces = forces_np.copy()
-                test_forces[t] += epsilon
+                test_forces_np = forces_np.copy()
+                test_forces_np[t] += delta_force # Perturb by 1N
                 
                 loss_new = FEMForceOptimization.run(
-                    torch.tensor(test_forces, device='cuda'),
+                    torch.tensor(test_forces_np, device='cuda'),
                     self.model, self.states, self.integrator, self.sim_dt, 
                     self.control, self.tendon_holder, self.sim_substeps, 
                     opt_frames, self.builder.finger_vertex_ranges
                 )
                 
-                # Calculate slope
-                grads_buffer[t] = (loss_new - loss_base) / epsilon
+                # Slope = (y2 - y1) / (x2 - x1)
+                grads_wrt_force[t] = (loss_new - loss_base) / delta_force
 
-            # Step C: Inject Gradients into Adam
-            forces_param.grad = torch.from_numpy(grads_buffer).to(device='cuda')
+            # 2. dForce / dLatent (Analytic Sigmoid Derivative)
+            # Derivative of sigmoid(x) is sigmoid(x) * (1 - sigmoid(x))
+            # We also scale by max_force
+            sig = current_forces_pct.detach().cpu().numpy()
+            d_force_d_latent = max_force * sig * (1.0 - sig)
             
-            # Step D: Update
+            # 3. Final Gradient via Chain Rule
+            final_grads = grads_wrt_force * d_force_d_latent
+            
+            # Inject Gradients into PyTorch tensor
+            latents_param.grad = torch.from_numpy(final_grads).to(device='cuda')
+            
+            # --- Update Step ---
             optimizer.step()
             
-            # Clip to valid range
-            with torch.no_grad():
-                forces_param.clamp_(0.0, 100.0)
+            # Debugging Output
+            # Look for Grads near 0.0 (Convergence)
+            # Negative Grads = Wants more force. Positive Grads = Wants less force.
+            print(f"Iter {iter_idx}: Loss {loss_base:.4f} | Forces {forces_np.astype(int)} | Grads {final_grads}")
 
         # Save Final Result
-        self.tendon_forces = wp.from_torch(forces_param.detach())
-        print(f"--- Done. Final Forces: {forces_param.detach().cpu().numpy()} ---")
+        final_forces = max_force * torch.sigmoid(latents_param)
+        self.tendon_forces = wp.from_torch(final_forces.detach())
+        print(f"--- Done. Final Forces: {final_forces.detach().cpu().numpy()} ---")
         return history
 
     def optimize_forces_lbfgs(self, iterations=10, learning_rate=1.0, opt_frames=10):
-        print(f"--- Optimizing Forces (Numerical + L-BFGS) ---")
         
         max_force = 100.0
-        epsilon = 5.0 
+        # Perturb force by 1.0 Newton (much safer than perturbing latent by 5.0)
+        delta_force = 1.0 
 
-        # x = log(p / (1-p)) where p is percentage of max force
+        # Initialize Latents (Inverse Sigmoid)
         start_vals = self.tendon_forces.numpy() / max_force
-        start_vals = np.clip(start_vals, 0.01, 0.99) # Prevent div by zero
+        start_vals = np.clip(start_vals, 0.01, 0.99)
         start_latents = np.log(start_vals / (1.0 - start_vals))
 
-        #forces_param = torch.tensor(self.tendon_forces.numpy(), dtype=torch.float32, device='cuda', requires_grad=True)
         latents_param = torch.tensor(start_latents, dtype=torch.float32, device='cuda', requires_grad=True)
         num_tendons = len(latents_param)
         
-        # L-BFGS Setup
-        optimizer = torch.optim.LBFGS([latents_param], lr=learning_rate, max_iter=5)
+        # Use line_search_fn='strong_wolfe' for better convergence
+        optimizer = torch.optim.LBFGS([latents_param], lr=learning_rate, max_iter=5, history_size=10, line_search_fn='strong_wolfe')
         
-        # History tracker
-        history = {
-            "loss": [],
-            "forces": []
-        }
+        history = {"loss": [], "forces": []}
         
-        # L-BFGS Closure
         def closure():
             optimizer.zero_grad()
             
-            # 1. Base Run
-            current_forces = max_force * torch.sigmoid(latents_param)
+            # --- 1. Forward Pass (Current Guess) ---
+            # Robust Sigmoid using PyTorch to prevent overflow/NaN
+            current_forces_pct = torch.sigmoid(latents_param)
+            current_forces = max_force * current_forces_pct
+            
             forces_np = current_forces.detach().cpu().numpy()
             
             loss_base = FEMForceOptimization.run(
@@ -641,37 +653,54 @@ class FEMTendon:
                 self.control, self.tendon_holder, self.sim_substeps, 
                 opt_frames, self.builder.finger_vertex_ranges
             )
-            print(f"   L-BFGS Evaluation Loss: {loss_base:.4f}")
             
-            # Log Data (Note: L-BFGS calls this multiple times per 'step')
-            # We log every evaluation to see the line search progress
+            # Log for plotting
             history["loss"].append(float(loss_base))
             history["forces"].append(forces_np.tolist())
             
-            # 2. Gradient Calculation (Numerical)
-            grads_buffer = np.zeros(num_tendons, dtype=np.float32)
-            latents_np = latents_param.detach().cpu().numpy()
+            # --- 2. Gradient Calculation via Chain Rule ---
+            # dLoss/dLatent = (dLoss/dForce) * (dForce/dLatent)
+            
+            # A. Calculate dLoss/dForce numerically
+            grads_wrt_force = np.zeros(num_tendons, dtype=np.float32)
+            
             for t in range(num_tendons):
-                test_latents = latents_np.copy()
-                test_latents[t] += epsilon
-                test_forces = max_force * (1.0 / (1.0 + np.exp(-test_latents)))
+                # Create a test force vector (Copy numpy array)
+                test_forces_np = forces_np.copy()
+                
+                # Perturb one tendon by +1 Newton
+                test_forces_np[t] += delta_force
+                
+                # Run Simulation
                 loss_new = FEMForceOptimization.run(
-                    torch.tensor(test_forces, device='cuda'),
+                    torch.tensor(test_forces_np, device='cuda'),
                     self.model, self.states, self.integrator, self.sim_dt, 
                     self.control, self.tendon_holder, self.sim_substeps, 
                     opt_frames, self.builder.finger_vertex_ranges
                 )
-                grads_buffer[t] = (loss_new - loss_base) / epsilon
+                
+                # Finite Difference Slope: (y2 - y1) / (x2 - x1)
+                grads_wrt_force[t] = (loss_new - loss_base) / delta_force
+
+            # B. Calculate dForce/dLatent analytically (Sigmoid derivative)
+            # F = Fmax * sigmoid(L)
+            # dF/dL = Fmax * sigmoid(L) * (1 - sigmoid(L))
             
-            # 3. Inject Gradient
-            latents_param.grad = torch.from_numpy(grads_buffer).to(device='cuda')
+            sig = current_forces_pct.detach().cpu().numpy()
+            d_force_d_latent = max_force * sig * (1.0 - sig)
             
+            # C. Chain Rule
+            final_grads = grads_wrt_force * d_force_d_latent
+            
+            # --- 3. Inject Gradient ---
+            latents_param.grad = torch.from_numpy(final_grads).to(device='cuda')
+            
+            print(f"   L-BFGS Loss: {loss_base:.4f} | Grads (Latent): {final_grads}")
             return torch.tensor(loss_base)
 
         for i in range(iterations):
             print(f"Iter {i}:")
             optimizer.step(closure)
-            
 
         # Save Final Result
         final_forces = max_force * torch.sigmoid(latents_param)

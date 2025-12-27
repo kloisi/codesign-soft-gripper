@@ -824,12 +824,13 @@ class InitializeFingers:
                 lr9  = self.optimizer.param_groups[0]["lr"]
                 lr2  = self.optimizer.param_groups[1]["lr"]
                 g2   = self.transform_2d.grad.detach().cpu().numpy().copy() if self.transform_2d.grad is not None else None
-                print(
-                    f"[iter {iter}] loss={self.loss.item():.4g}"
-                    f"  finger_loss={self.finger_loss.item():.4g} cloth_loss(norm)={self.cloth_loss.item():.4g}"
-                    f"  radius params (transform_2d): {current_radius}"
-                    f"  lr2={lr2:.3e}, lr9={lr9:.3e}, grad2_norm={np.linalg.norm(g2) if g2 is not None else None}"
-                )
+                # print(
+                #     f"[iter {iter}] loss={self.loss.item():.4g}"
+                #     f"  finger_loss={self.finger_loss.item():.4g} cloth_loss(norm)={self.cloth_loss.item():.4g}"
+                #     f"  radius params (transform_2d): {current_radius}"
+                #     f"  lr2={lr2:.3e}, lr9={lr9:.3e}, grad2_norm={np.linalg.norm(g2) if g2 is not None else None}"
+                # )
+                print(f"[iter {iter}]" f"radius = {current_radius}")
 
         self.state0, self.state1 = self.state1, self.state0
         self.optimizer.zero_grad()
@@ -958,7 +959,7 @@ class InitializeFingers:
          
         init_trans = [wp.transform_multiply(body_trans[i], self.init_transforms[i]) for i in range(self.finger_num)]
 
-        self.debug_print_proxy_sdf(state_for_T=self.state1, stride=10)
+        #self.debug_print_proxy_sdf(state_for_T=self.state1, stride=10)
 
         # after convergence / before return
         self.capture_proxy_points_frozen() # for viz of cloth proxy points
