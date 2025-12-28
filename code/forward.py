@@ -498,6 +498,28 @@ class FEMTendon:
         print(f"--- Done. Final Forces: {final_forces.detach().cpu().numpy()} ---")
         return history
     
+    def optimize_forces_native_warp(self, iterations=10, learning_rate=0.5, opt_frames=100):
+        # 1. Ensure forces have gradients enabled
+        self.tendon_forces.requires_grad = True
+
+        # 2. Call the external optimizer
+        history = NativeWarpOptimizer.optimize(
+            tendon_forces=self.tendon_forces,
+            model=self.model,
+            states=self.states,
+            integrator=self.integrator,
+            control=self.control,
+            tendon_holder=self.tendon_holder,
+            sim_dt=self.sim_dt,
+            sim_substeps=self.sim_substeps,
+            opt_frames=opt_frames,
+            finger_vertex_ranges=self.builder.finger_vertex_ranges,
+            iterations=iterations,
+            learning_rate=learning_rate
+        )
+
+        return history
+    
     def plot_single_run(self, history, method_name="Optimization", save_dir="logs"):
         """
         Plots loss and forces for a single optimization run and saves data to CSV.
@@ -693,21 +715,28 @@ if __name__ == "__main__":
         if not args.no_force_opt:
             print(f"--- Running optimization using: {method_name.upper()} ---")
             
-            if method_name == "sgd":
-                history = tendon.optimize_forces(
-                    iterations=10, learning_rate=0.1, opt_frames=100
+            if method_name == "autodiff":
+                # 1. Store original values
+                original_substeps = tendon.sim_substeps
+                original_dt = tendon.sim_dt 
+
+                # 2. Update Substeps AND DT
+                target_substeps = 10  # Lower value for speed/stability
+                tendon.sim_substeps = target_substeps
+                tendon.sim_dt = tendon.frame_dt / target_substeps  
+
+                print(f" Optimization dt: {tendon.sim_dt:.6f} (Substeps: {tendon.sim_substeps})")
+
+                # 3. Run Optimization
+                history = tendon.optimize_forces_native_warp(
+                    iterations=0, 
+                    learning_rate=1.0, 
+                    opt_frames=100
                 )
-            
-            elif method_name == "adam":
-                history = tendon.optimize_forces_adam(
-                    iterations=20, learning_rate=10.0, opt_frames=100
-                )
-            
-            elif method_name == "autodiff":
-                # Autodiff needs a much smaller LR
-                history = tendon.optimize_forces_autodiff(
-                    iterations=10, learning_rate=0.01, opt_frames=100
-                )
+
+                # 4. Restore original values for high-quality rendering
+                tendon.sim_substeps = original_substeps
+                tendon.sim_dt = original_dt
             
             elif method_name == "lbfgs":
                 # LBFGS usually runs fewer iterations but does more work per step
