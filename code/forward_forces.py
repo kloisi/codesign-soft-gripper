@@ -20,6 +20,8 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, FFMpegWriter
 from scipy.spatial.transform import Rotation as R
 
+from scipy.signal import butter, filtfilt
+
 def animate_point_clouds(point_clouds,
                          interval=50,
                          elev=30,
@@ -357,109 +359,7 @@ class FEMTendon:
                 self.object_body_f = self.states[index].body_f
 
         self.object_q = self.states[-1].body_q
-    
-    def simulate(self):
-        # sample random stiffness
-        wp.launch(sample_logk,
-                dim=len(self.log_K_warp),
-                inputs=[self.kernel_seed + self.iter, 13.5, 17.0],
-                outputs=[self.log_K_warp])
-        print(f"iter:{self.iter}, sampled log_K:", self.log_K_warp.numpy()[:10])
 
-        if not getattr(self, "has_object", True):
-            if self.use_cuda_graph:
-                wp.capture_launch(self.graph)
-            else:
-                self.forward()
-            self.sim_time += self.frame_dt
-            self.iter += 1
-            return
-
-        # sample density
-        new_density = np.random.uniform(1e0, 1e1)
-        utils.update_object_density(self.model, 0, new_density, self.object_density)
-        self.object_density = new_density
-        print("object density:", self.object_density)
-        print("object mass:", self.model.body_mass.numpy())
-
-        if self.use_cuda_graph:
-            wp.capture_launch(self.graph)
-        else:
-            self.forward()
-
-        end_particle_q = self.states[-1].particle_q.numpy()[0, :]
-        particle_trans_q = end_particle_q[0:3] - self.init_particle_q[0:3]
-        object_trans_q = self.object_q.numpy()[0, 0:3] - self.init_body_q[0:3]
-
-        diff_q = object_trans_q - particle_trans_q
-        wp.sim.collide(self.model, self.states[-1])
-        collide_num = self.model.rigid_contact_count.numpy()
-        print("collision:", collide_num)
-
-        if np.linalg.norm(diff_q) > 1e2:
-            print(f'Error in diff_q {self.ycb_object_name}')
-            return
-        object_body_f = self.object_body_f.numpy().flatten()
-        object_grav = -9.8 * self.model.body_mass.numpy()[0]
-        self.object_grav[4] = object_grav
-
-        if self.success_flag.numpy()[0] == 0:
-            print(f'Error in simulation {self.ycb_object_name}')
-            collide_num += 1
-            diff_q[1] -= 0.1
-            object_body_f += self.object_grav 
-        if np.linalg.norm(object_body_f) < 1e-5:
-            print(f'Zero in object body force {self.ycb_object_name}')
-            collide_num += 1
-
-        object_body_f += self.object_grav 
-        print(f'{self.ycb_object_name} {self.iter} body_f:', object_body_f)
-        print(f'{self.ycb_object_name} {self.iter} body_q:', diff_q)
-
-        this_output = object_body_f.tolist()
-        this_output += (diff_q).flatten().tolist()
-        this_output += collide_num.flatten().tolist()
-
-        self.save_list.append(this_output)
-        self.log_K_list.append(self.log_K_warp.numpy().flatten().tolist())
-        self.mass_list.append(self.model.body_mass.numpy().flatten().tolist())
-        self.density_list.append([self.object_density])
-
-        if self.save_log:
-            if (self.iter+1) % 10 == 0 or self.iter == self.train_iters - 1:
-                self.save_data()
-        self.sim_time += self.frame_dt
-        self.iter += 1
-    
-    def reset_states(self, finger_mesh):
-        for i in range(self.finger_num):
-            wp.launch(utils.update_particles_input,
-                      dim=len(finger_mesh[i]),
-                      inputs=[self.states[0].particle_q, 
-                              finger_mesh[i],
-                              i*len(finger_mesh[i]),]
-                      )
-        print("reset body_q:", self.states[0].body_q.numpy())
-        self.states[0].body_qd.zero_()
-        self.states[0].particle_qd.zero_()
-        self.success_flag = wp.array([1], dtype=wp.int32, requires_grad=False)
-        self.object_mass = self.model.body_mass.numpy()[0]
-        self.log_K_list = []
-        self.save_list = []
-        self.mass_list = []
-        self.density_list = []
-
-        self.run_name = f"{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S-%f')}"
-        self.file_name = self.save_dir + f"{self.run_name}.npz"
-
-    def save_data(self):
-        np.savez(self.file_name,
-                 log_k=np.array(self.log_K_list),
-                 output=np.array(self.save_list),
-                 init_transform=self.finger_transform,
-                 object_mass=np.array(self.mass_list),
-                 density_list=np.array(self.density_list),)
-        print("Saved data to:", self.file_name)
 
     def render(self):
         if self.renderer is None:
@@ -660,6 +560,80 @@ class FEMTendon:
             inputs=[self.log_K_warp, self.v, self.tet_block_ids],
             outputs=[self.model.tet_materials],
         )
+    
+    def run_and_record_force(self):
+        """
+        Run the simulation and record the linear force acting on the object (Body 0).
+        Returns: np.ndarray of shape (T, 3)
+        """
+        recorded_forces = []
+        
+        # Assuming the object is the first rigid body (index 0)
+        object_body_idx = 0
+        
+        for frame in range(self.num_frames):
+            for i in range(self.sim_substeps):
+                index = i + frame * self.sim_substeps
+
+                self.states[index].clear_forces()
+                self.tendon_holder.reset()
+
+                if i % 20 == 0:
+                    wp.sim.collide(self.model, self.states[index])
+
+                self.control.update_target_vel(frame)
+                
+                # Apply tendon forces
+                self.tendon_holder.apply_force(
+                    self.tendon_forces,
+                    self.states[index].particle_q,
+                    self.success_flag,
+                )
+                
+                # Integrate physics
+                self.integrator.simulate(
+                    self.model,
+                    self.states[index],
+                    self.states[index + 1],
+                    self.sim_dt,
+                    self.control,
+                )
+
+                # --- EXTRACT FORCE HERE ---
+                # body_f is a spatial vector array. We need to copy it to CPU.
+                # Shape is (Num_Bodies, 6). 0-2 is Torque, 3-5 is Force.
+                # Note: This .numpy() call creates a sync overhead, but is necessary for recording.
+                current_body_f = self.states[index].body_f.numpy()
+                
+                # Extract linear force (indices 3,4,5) for the object (index 0)
+                # If your object ID is different, change [0] to [object_id]
+                linear_force = current_body_f[object_body_idx, 3:6]
+                
+                recorded_forces.append(linear_force.copy())
+
+        return np.array(recorded_forces)
+    
+    
+
+def get_effective_max_force(time_array, force_array, cutoff_freq=50.0):
+    """
+    Returns the absolute maximum force (magnitude) after filtering.
+    """
+    if len(time_array) < 2: return 0.0, np.zeros_like(force_array)
+    dt = time_array[1] - time_array[0]
+    fs = 1.0 / dt
+    
+    # Filter
+    nyq = 0.5 * fs
+    normal_cutoff = cutoff_freq / nyq
+    b, a = butter(N=2, Wn=normal_cutoff, btype='low', analog=False)
+    filtered_force = filtfilt(b, a, force_array)
+    
+    # --- CHANGED: Use Absolute Maximum ---
+    # This finds the strongest point, whether it's positive (push) or negative (pull/hook)
+    abs_max = np.max(np.abs(filtered_force))
+    
+    return abs_max, filtered_force
 
         
 
@@ -677,7 +651,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--num_frames", type=int, default=1000, help="Total number of frames per training iteration.")
     parser.add_argument("--stiff_iters", type=int, default=3, help="Total number of sampling stiffness iterations.")
-    parser.add_argument("--pose_iters", type=int, default=3, help="Total number of pose iterations.")
+    parser.add_argument("--pose_iters", type=int, default=1000, help="Total number of pose iterations.")
     parser.add_argument("--object_name", type=str, default="", help="Name of the object to load.")
     parser.add_argument("--object_density", type=float, default=2e0, help="Density of the object.")
     parser.add_argument("--verbose", action="store_true", help="Print out additional status messages during execution.")
@@ -689,6 +663,8 @@ if __name__ == "__main__":
     parser.add_argument("--random", action="store_true", help="Add random noise to the initial position.")
     parser.add_argument("--finger_num", type=int, default=2, help="Number of fingers.")
     parser.add_argument("--is_render", action="store_true", help="Enable USD rendering.")
+    parser.add_argument("--plot_forces", action="store_true", help="plot forces on object.")
+    parser.add_argument("--plot_positions", action="store_true", help="plot fingertip positions.")
 
     # quick vizualization related args
     parser.add_argument("--quick_viz", action="store_true", help="Quick matplotlib cloth point cloud animation.")
@@ -713,11 +689,37 @@ if __name__ == "__main__":
         finger_transform = None
         init_finger = None
 
-        force_values = [10.0, 20.0, 30.0]
-        stiffness_values = [5e5, 1e6, 2e6]
+        #force_values = [100.0]
+        force_values = [20.0, 40.0, 60.0, 80.0, 100.0]
+        #force_values = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0]
+        stiffness_values = [2e6]
 
         trajectories = {}   # (F, K) -> (T, 3)
+        force_trajectories = {}  # F -> (T, 3)
         sample_dt = {}      # (F, K) -> dt
+
+        print("Running InitializeFingers to optimise initial pose...")
+        if not args.no_init:
+            init_finger = InitializeFingers(
+                stage_path="femtendon_sim.usd",     # or args.stage_path, doesn’t really matter here
+                finger_len=finger_len,
+                finger_rot=finger_rot,
+                finger_width=finger_width,
+                stop_margin=0.0005,
+                num_frames=30,                      # short optimisation horizon
+                iterations=args.pose_iters,         # how many gradient steps
+                scale=scale,
+                num_envs=1,
+                ycb_object_name=args.object_name,
+                object_rot=object_rot,
+                is_render=False,                    # no USD rendering during optimisation
+                verbose=args.verbose,
+                is_triangle=False,
+                finger_num=args.finger_num,
+                add_random=args.random,
+            )
+
+            finger_transform, init_finger_q = init_finger.get_initial_position()
 
         for K in stiffness_values:
             print(f"\n=== Using stiffness K = {K:.2e} ===")
@@ -756,88 +758,136 @@ if __name__ == "__main__":
                 tendon.set_stiffness(K)
                 tendon.set_tendon_force(F)
 
-                tip_traj = tendon.run_and_record_tip(finger_index=0)  # (T, 3)
 
-                trajectories[(F, K)] = tip_traj
+                #tip_traj = tendon.run_and_record_tip(finger_index=0)  # (T, 3)
+
+                #trajectories[(F, K)] = tip_traj
+                object_forces = tendon.run_and_record_force()  # (T, 3)
+
+                force_trajectories[(F,K)] = object_forces
                 sample_dt[(F, K)] = tendon.sim_dt
 
                 # just to confirm:
                 K_current = float(np.exp(tendon.log_K_warp.numpy()[0]))
                 print(f"Force {F} N used stiffness K = {K_current:.3e}")
 
-        # ---------- Y-position vs time ----------
-        plt.figure(figsize=(8, 4))
+        if args.plot_forces:
+            fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+            
+            sorted_keys = sorted(force_trajectories.keys())
 
-        for (F, K), traj in trajectories.items():
-            if traj.size == 0:
-                continue
-            if traj.ndim != 2 or traj.shape[1] != 3:
-                continue
+            for (F, K) in sorted_keys:
+                obj_f_vec = force_trajectories[(F, K)]
+                if obj_f_vec.size == 0: continue
+                
+                # Use Force X (since we determined it's the pushing direction)
+                raw_force = obj_f_vec[:, 0]
+                
+                # Create time array
+                dt = sample_dt[(F, K)]
+                t = np.arange(len(raw_force)) * dt
 
-            mask = np.isfinite(traj).all(axis=1)
-            if not np.any(mask):
-                continue
+                # ... inside the loop ...
+            
+                # --- APPLY THE FILTER ---
+                # We now get the 'abs_max' magnitude
+                force_mag, smooth_force = get_effective_max_force(t, raw_force, cutoff_freq=50)
+                
+                # Calculate Ratio
+                ratio = (force_mag / F) * 100.0
+                
+                print(f"Input: {F}N -> Max Magnitude: {force_mag:.2f}N (Efficiency: {ratio:.1f}%)")
 
-            y = traj[mask, 1]
-            n = y.size
-            dt = float(sample_dt[(F, K)])
-            t = np.arange(n) * dt
+                # Plotting
+                # We plot the smooth force, but the label shows the MAGNITUDE
+                p = ax.plot(t, raw_force, alpha=0.2) 
+                color = p[0].get_color()
+                ax.plot(t, smooth_force, color=color, linewidth=2, label=f"F={F}N (Mag: {force_mag:.1f}N)")
 
-            label = f"F={F:.1f} N, K={K:.2e}"
-            plt.plot(t, y, label=label)
+            ax.set_ylabel("Force X [N]")
+            ax.set_xlabel("Time [s]")
+            ax.set_title("Filtered Pushing Force")
+            ax.legend()
+            ax.grid(True)
+            
+            plt.savefig("filtered_max_force.png")
+            print("Saved filtered_max_force.png")
 
-        plt.xlabel("Time [s]")
-        plt.ylabel("Tip Y position")
-        plt.title("Fingertip Y-position over time")
-        plt.grid(True)
-        plt.legend()
 
-        out_path_y = "fingertip_y_vs_time.png"
-        plt.savefig(out_path_y, dpi=300, bbox_inches="tight")
-        print(f"Saved Y-vs-time figure to {out_path_y}")
+        if args.plot_positions: 
+            # ---------- Y-position vs time ----------
+            plt.figure(figsize=(8, 4))
 
-        # ---------- Final tip Y vs tendon force (one curve per stiffness) ----------
-        from collections import defaultdict
+            for (F, K), traj in trajectories.items():
+                if traj.size == 0:
+                    continue
+                if traj.ndim != 2 or traj.shape[1] != 3:
+                    continue
 
-        forces_by_K = defaultdict(list)
-        final_y_by_K = defaultdict(list)
+                mask = np.isfinite(traj).all(axis=1)
+                if not np.any(mask):
+                    continue
 
-        for (F, K), traj in trajectories.items():
-            if traj.size == 0:
-                continue
+                y = traj[mask, 1]
+                n = y.size
+                dt = float(sample_dt[(F, K)])
+                t = np.arange(n) * dt
 
-            mask = np.isfinite(traj).all(axis=1)
-            if not np.any(mask):
-                continue
+                label = f"F={F:.1f} N, K={K:.2e}"
+                plt.plot(t, y, label=label)
 
-            traj_valid = traj[mask]
-            y_final = traj_valid[-1, 1]
+            plt.xlabel("Time [s]")
+            plt.ylabel("Tip Y position")
+            plt.title("Fingertip Y-position over time")
+            plt.grid(True)
+            plt.legend()
 
-            forces_by_K[K].append(F)
-            final_y_by_K[K].append(y_final)
+            out_path_y = "fingertip_y_vs_time.png"
+            plt.savefig(out_path_y, dpi=300, bbox_inches="tight")
+            print(f"Saved Y-vs-time figure to {out_path_y}")
 
-        plt.figure(figsize=(6, 4))
+            # ---------- Final tip Y vs tendon force (one curve per stiffness) ----------
+            from collections import defaultdict
 
-        for K, forces_list in forces_by_K.items():
-            forces_arr = np.array(forces_list)
-            y_arr = np.array(final_y_by_K[K])
+            forces_by_K = defaultdict(list)
+            final_y_by_K = defaultdict(list)
 
-            # sort by force for a clean line
-            idx = np.argsort(forces_arr)
-            forces_arr = forces_arr[idx]
-            y_arr = y_arr[idx]
+            for (F, K), traj in trajectories.items():
+                if traj.size == 0:
+                    continue
 
-            plt.plot(forces_arr, y_arr, "o-", lw=2, label=f"K={K:.2e}")
+                mask = np.isfinite(traj).all(axis=1)
+                if not np.any(mask):
+                    continue
 
-        plt.xlabel("Tendon force [N]")
-        plt.ylabel("Final fingertip Y position")
-        plt.title("Final Y-position vs Tendon Force (per stiffness)")
-        plt.grid(True)
-        plt.legend()
+                traj_valid = traj[mask]
+                y_final = traj_valid[-1, 1]
 
-        out_path_force = "final_y_vs_force.png"
-        plt.savefig(out_path_force, dpi=300, bbox_inches="tight")
-        print(f"Saved final-Y-vs-force plot to {out_path_force}")
+                forces_by_K[K].append(F)
+                final_y_by_K[K].append(y_final)
+
+            plt.figure(figsize=(6, 4))
+
+            for K, forces_list in forces_by_K.items():
+                forces_arr = np.array(forces_list)
+                y_arr = np.array(final_y_by_K[K])
+
+                # sort by force for a clean line
+                idx = np.argsort(forces_arr)
+                forces_arr = forces_arr[idx]
+                y_arr = y_arr[idx]
+
+                plt.plot(forces_arr, y_arr, "o-", lw=2, label=f"K={K:.2e}")
+
+            plt.xlabel("Tendon force [N]")
+            plt.ylabel("Final fingertip Y position")
+            plt.title("Final Y-position vs Tendon Force (per stiffness)")
+            plt.grid(True)
+            plt.legend()
+
+            out_path_force = "final_y_vs_force.png"
+            plt.savefig(out_path_force, dpi=300, bbox_inches="tight")
+            print(f"Saved final-Y-vs-force plot to {out_path_force}")
 
         # optional: still allow quick_viz / render for the last run if you want
         if args.is_render:
