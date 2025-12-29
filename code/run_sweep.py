@@ -15,9 +15,9 @@ def run_experiment_sweep():
     
     # The variables to sweep over
     #object_list = ["013_apple", "006_mustard_bottle", "acropora_cervicornis"]
-    object_list = ["acropora_cervicornis", "006_mustard_bottle"]
-    #finger_counts = [3,4,5,6,7,8]
-    finger_counts = [3,4]
+    object_list = ["acropora_cervicornis", "acropora_florida", "acropora_loripes", "acropora_millepora", "acropora_nobilis", "acropora_palmata", "acropora_sarmentosa", "acropora_tenuis", "fungia_scutaria", "goniastrea_aspera", "montipora_capitata", "platygyra_daedalea", "platygyra_lamellina", "pocillopora_meandrina"]
+    finger_counts = [3,4,5,6,7,8,9]
+    #finger_counts = [3,4]
     
     # Fixed parameters
     finger_len = 11
@@ -102,7 +102,7 @@ def run_experiment_sweep():
 
                     # Run L-BFGS Force Optimization
                     history = tendon.optimize_forces_lbfgs(
-                        iterations=1, # Keep low for testing, increase for real results
+                        iterations=2, # Keep low for testing, increase for real results
                         learning_rate=1.0, 
                         opt_frames=100
                     )
@@ -151,17 +151,17 @@ def plot_results(df):
     sns.set_theme(style="whitegrid")
     
     # Create a figure with 3 subplots
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(30, 10))
     
     # Plot 1: Radius vs Fingers (Grouped by Object)
     sns.lineplot(data=df, x="Num_Fingers", y="Radius", hue="Object", marker="o", ax=axes[0])
-    axes[0].set_title("Optimal Initial Radius")
+    axes[0].set_title("Optimal Radius")
     axes[0].set_ylabel("Radius (sim units)")
     
     # Plot 2: Final Loss vs Fingers
     sns.lineplot(data=df, x="Num_Fingers", y="Final_Loss", hue="Object",marker="o", ax=axes[1])
-    axes[1].set_title("Optimization Loss (Lower is Better)")
-    axes[1].set_ylabel("Distance Loss")
+    axes[1].set_title("Optimization Loss")
+    axes[1].set_ylabel("Distance and Force Regularization Loss")
     
     # Plot 3: Average Force vs Fingers
     sns.lineplot(data=df, x="Num_Fingers", y="Avg_Force", hue="Object",marker="o", ax=axes[2])
@@ -171,9 +171,10 @@ def plot_results(df):
     plt.tight_layout()
     plt.savefig("sweep_results/sweep_analysis.png")
     print("Plots saved to sweep_results/sweep_analysis.png")
-    plt.show()
 
 if __name__ == "__main__":
     df_results = run_experiment_sweep()
+    #csv_path = "sweep_results/experiment_data.csv"
+    #df_results = pd.read_csv(csv_path)
     if not df_results.empty:
         plot_results(df_results)
