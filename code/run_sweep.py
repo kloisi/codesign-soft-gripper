@@ -14,7 +14,7 @@ def run_experiment_sweep():
     device = "cuda"  # or "cpu"
     
     # The variables to sweep over
-    #object_list = ["013_apple", "006_mustard_bottle", "acropora_cervicornis"]
+    #object_list = ["013_apple", "006_mustard_bottle"]
     object_list = ["acropora_cervicornis", "acropora_florida", "acropora_loripes", "acropora_millepora", "acropora_nobilis", "acropora_palmata", "acropora_sarmentosa", "acropora_tenuis", "fungia_scutaria", "goniastrea_aspera", "montipora_capitata", "platygyra_daedalea", "platygyra_lamellina", "pocillopora_meandrina"]
     finger_counts = [3,4,5,6,7,8,9]
     #finger_counts = [3,4]
@@ -48,7 +48,7 @@ def run_experiment_sweep():
                         finger_width=finger_width,
                         stop_margin=0.0005,
                         num_frames=30,
-                        iterations=10000,  # Lower iterations for speed during testing
+                        iterations=5000,  # Lower iterations for speed during testing
                         scale=scale,
                         num_envs=1,
                         ycb_object_name=obj_name,
@@ -137,6 +137,7 @@ def run_experiment_sweep():
                 del tendon
                 import gc
                 gc.collect()
+                wp.synchronize()
 
     # --- 2. SAVE RESULTS ---
     df = pd.DataFrame(results_data)
