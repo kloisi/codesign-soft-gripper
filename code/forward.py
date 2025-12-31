@@ -235,7 +235,7 @@ class FEMTendon:
         self.control.vel_values = wp.array(
             np.zeros([1, 3]),
             dtype=wp.vec3, requires_grad=self.requires_grad)
-        self.tendon_forces = wp.array([10.0]*self.finger_num, dtype=wp.float32, requires_grad=self.requires_grad)
+        self.tendon_forces = wp.array([50.0]*self.finger_num, dtype=wp.float32, requires_grad=self.requires_grad)
 
         self.tendon_holder.init_tendon_variables(requires_grad=self.requires_grad)
     
@@ -344,6 +344,10 @@ class FEMTendon:
             # Log for plotting
             history["loss"].append(float(loss_base))
             history["forces"].append(forces_np.tolist())
+
+            if learning_rate == 0.0:
+                latents_param.grad = torch.zeros_like(latents_param)
+                return torch.tensor(loss_base)
             
             # --- 2. Gradient Calculation via Chain Rule ---
             # dLoss/dLatent = (dLoss/dForce) * (dForce/dLatent)

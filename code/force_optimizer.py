@@ -77,7 +77,7 @@ class FEMForceOptimization:
 
         # Weight tuning
         dist_scale = 100.0
-        force_scale = 0.005
+        force_scale = 0.01
 
         term_dist = dist_loss * dist_scale
         term_force = force_loss * force_scale
