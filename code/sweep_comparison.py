@@ -150,7 +150,52 @@ def compare_finger_counts(merged_df):
     plt.savefig(output_filename)
     print(f"\nFinger analysis plot saved to '{output_filename}'")
 
+def analyze_fingers_force(df):
+    """
+    Analyzes the effect of finger count on the average force.
+    """
+    print("\n--- Finger Count Analysis: Forces ---")
+    
+    # 1. Identify force columns
+    force_cols = [col for col in df.columns if 'Force_' in col]
+    
+    # 2. Group by 'Num_Fingers' and calculate the mean
+    finger_force_stats = df.groupby('Num_Fingers')[force_cols].mean()
+    
+    print("Average Force by Number of Fingers:")
+    print(finger_force_stats.round(2))
+    
+    # 3. Find the lowest force count for each method
+    print("\nOptimal Number of Fingers (Lowest Average Force):")
+    for col in force_cols:
+        optimal_fingers = finger_force_stats[col].idxmin()
+        min_force = finger_force_stats[col].min()
+        print(f"  {col.replace('Force_', '')}: {optimal_fingers} fingers (Force: {min_force:.2f} N)")
+
+    # 4. Visualization
+    plt.figure(figsize=(10, 6))
+    
+    markers = ['o', 's', '^', 'D']
+    for i, col in enumerate(force_cols):
+        method_name = col.replace('Force_', '')
+        plt.plot(finger_force_stats.index, finger_force_stats[col], 
+                 marker=markers[i % len(markers)], 
+                 linewidth=2, 
+                 label=method_name)
+    
+    plt.xlabel('Number of Fingers')
+    plt.ylabel('Average Applied Force (N)')
+    plt.title('Average Force vs Number of Fingers')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.xticks(finger_force_stats.index)
+    
+    output_filename = 'finger_force_analysis.png'
+    plt.savefig(output_filename)
+    print(f"\nForce analysis plot saved to '{output_filename}'")
+
 
 if __name__ == "__main__":
     #compare_four_sweeps()
-    compare_finger_counts(pd.read_csv('all_sweeps_merged.csv'))
+    #compare_finger_counts(pd.read_csv('all_sweeps_merged.csv'))
+    analyze_fingers_force(pd.read_csv('all_sweeps_merged.csv'))
