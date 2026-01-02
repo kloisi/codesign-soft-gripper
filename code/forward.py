@@ -1,3 +1,5 @@
+# forward.py
+
 import math
 import os
 import time
@@ -19,11 +21,17 @@ from tendon_model import TendonModelBuilder, TendonRenderer, TendonHolder
 from init_pose import InitializeFingers
 from force_optimizer import FEMForceOptimization
 
-import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, FFMpegWriter
 from scipy.spatial.transform import Rotation as R
 
-from quick_viz import quick_visualize
+from quick_viz import quick_visualize, plot_last_frame_with_voxels
+
+from enclosed_volume_voxel import (
+    VoxelFillConfig,
+    VoxelVolumeEstimator,
+    prepare_vox_topology_from_model,
+)
+
 
 @wp.kernel
 def update_materials(
@@ -105,9 +113,17 @@ class FEMTendon:
         self.has_object = bool(self.ycb_object_name)
 
         self.no_cloth = bool(no_cloth)
-        
+
+        # mw_added, todo: check again if these are good
+        self.last_voxel_volume = None
+        self.last_voxel_debug = None
+        self._last_voxel_q = None
+
         self.curr_dir = os.path.dirname(os.path.realpath(__file__))
-        self.stage_path = self.curr_dir + "/../output/" + stage_path + "_" + f"{ycb_object_name}_{log_prefix}_frame{num_frames}" + ".usd"
+        if stage_path is None: # so we can run sweeps without rendering
+            self.stage_path = None
+        else:
+            self.stage_path = self.curr_dir + "/../output/" + stage_path + "_" + f"{ycb_object_name}_{log_prefix}_frame{num_frames}" + ".usd"
 
         save_dir = self.curr_dir + "/../data_gen/" + f"{ycb_object_name}_frame{num_frames}/rand/"
         if save_log and (not os.path.exists(save_dir)):
@@ -137,6 +153,30 @@ class FEMTendon:
             add_drop_cloth=False, # add cloth for dropping test
             )
         self.model = self.builder.model
+
+
+        # --- MW_ADDED, for enclosed volume ---
+        self.voxvol = None
+        if (not self.no_cloth) and self.has_object:
+            cloth_tris, solid_tris, rim_ids = prepare_vox_topology_from_model(self.model)
+
+            cfg = VoxelFillConfig(
+                voxel_size=0.002 * float(self.scale),
+                pad_vox=3,
+                cloth_thickness_vox=1,
+                solid_thickness_vox=1,
+                lid_thickness_vox=1,
+                sample_step_factor=0.5,
+            )
+
+            self.voxvol = VoxelVolumeEstimator(
+                cloth_tri_indices=cloth_tris,
+                solid_tri_indices=solid_tris,
+                rim_ids=rim_ids,
+                cfg=cfg,
+            )
+
+
         self.control = self.model.control(requires_grad=self.requires_grad)
 
         # for quick viz of the YCB object
@@ -200,6 +240,10 @@ class FEMTendon:
             with wp.ScopedCapture() as capture:
                 self.forward()
             self.graph = capture.graph
+
+        self.vol_logger = VolumeLogger()
+        self._vox_calibrated = False
+
 
     def init_tendons(self):
         finger_waypoint_num = [len(self.builder.waypoints[i]) for i in range(self.finger_num)]
@@ -267,6 +311,16 @@ class FEMTendon:
                 inputs=[self.log_K_warp, self.v,
                         self.tet_block_ids],
                 outputs=[self.model.tet_materials])
+        
+
+        # MW_ADDED, for enclosed volume, one-time rim calibration from q0
+        if (self.voxvol is not None) and (not self.no_cloth) and self.has_object and (not self._vox_calibrated):
+            q0 = self.states[0].particle_q.numpy()
+            if q0.ndim == 3:
+                q0 = q0[0]
+            self.voxvol.set_open_rims(q0)
+
+            self._vox_calibrated = True
 
         for frame in range(self.num_frames):
 
@@ -286,8 +340,60 @@ class FEMTendon:
 
                 self.object_body_f = self.states[index].body_f
 
+            # MW_ADDED, for enclosed volume
+            s_end = self.states[(frame + 1) * self.sim_substeps] # after substeps, use state at end of frame
+
+            if (self.voxvol is not None) and (not self.no_cloth) and self.has_object:
+
+                q_np = s_end.particle_q.numpy()
+                if q_np.ndim == 3:
+                    q_np = q_np[0]
+                elif q_np.ndim == 1:
+                    q_np = q_np.reshape(-1, 3)
+
+                is_last_frame = (frame == self.num_frames - 1)
+
+                vol_vox, dbg = self.voxvol.compute(q_np, return_points=is_last_frame)
+                self.vol_logger.log(
+                    step=(frame + 1) * self.sim_substeps - 1,
+                    sim_time=(frame + 1) * self.frame_dt, # true end-of-frame time
+                    frame=frame,
+                    substep=self.sim_substeps - 1,
+                    vol=vol_vox,
+                    dbg=dbg,
+                )
+                if is_last_frame:
+                    self.last_voxel_volume = float(vol_vox)
+                    self.last_voxel_debug = dbg
+                    self._last_voxel_q = q_np   # optional, for rim range prints
+
+
         self.object_q = self.states[-1].body_q
         self.object_body_f = self.states[-1].body_f # body force from last state after integration
+
+
+        # MW_ADDED, for enclosed volume, save log and print
+        obj = self.ycb_object_name if self.ycb_object_name else "noobj"
+        self.vol_logger.to_csv(f"logs/volume_timeseries_{obj}.csv")
+
+        if self.verbose and (self.last_voxel_volume is not None):
+            dbg = self.last_voxel_debug
+            q_np = self._last_voxel_q
+            print(f"[vox] vol={self.last_voxel_volume:.6g} shape={dbg['shape']} enclosed_vox={dbg['enclosed_voxels']}")
+            print("[voxdbg]",
+                "voxel=", dbg["voxel_size"],
+                "y_bottom=", dbg["y_bottom"],
+                "y_top=", dbg["y_top"],
+                "iy_lid=", dbg["iy_lid"],
+                "blocked=", dbg["blocked_voxels"])
+            print("[voxpts] blocked_pts", dbg["blocked_pts"].shape, "enclosed_pts", dbg["enclosed_pts"].shape)
+            print("[rimT] top ids:", len(self.voxvol.top_rim_ids), "bottom ids:", len(self.voxvol.bottom_rim_ids))
+            print("[rimT] bot_yT range:", q_np[self.voxvol.bottom_rim_ids,1].min(), q_np[self.voxvol.bottom_rim_ids,1].max())
+            print("[rimT] top_yT range:", q_np[self.voxvol.top_rim_ids,1].min(), q_np[self.voxvol.top_rim_ids,1].max())
+
+        if self.verbose and (self.last_voxel_debug is not None):
+            plot_last_frame_with_voxels(self, self.last_voxel_debug)
+
     
     def simulate(self):
         # sample random stiffness
@@ -745,6 +851,34 @@ class FEMTendon:
         print(f"[{method_name}] Plots saved to {plot_filename}")
         plt.close(fig)
 
+
+# MW_ADDED, for enclosed volume,
+class VolumeLogger:
+    def __init__(self):
+        self.rows = []
+
+    def log(self, step, sim_time, frame, substep, vol, dbg=None):
+        row = {
+            "step": int(step),
+            "t": float(sim_time),
+            "frame": int(frame),
+            "substep": int(substep),
+            "vol_vox": float(vol),
+        }
+        # optional debug columns (nice for sanity checks)
+        if dbg is not None:
+            row.update({
+                "enclosed_voxels": int(dbg.get("enclosed_voxels", -1)),
+                "blocked_voxels": int(dbg.get("blocked_voxels", -1)),
+                "y_bottom": float(dbg.get("y_bottom", np.nan)),
+                "y_top": float(dbg.get("y_top", np.nan)),
+            })
+        self.rows.append(row)
+
+    def to_csv(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        pd.DataFrame(self.rows).to_csv(path, index=False)
+
     
 if __name__ == "__main__":
     import argparse
@@ -759,7 +893,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--num_frames", type=int, default=1000, help="Total number of frames per training iteration.")
     parser.add_argument("--stiff_iters", type=int, default=3, help="Total number of sampling stiffness iterations.")
-    parser.add_argument("--pose_iters", type=int, default=10000, help="Total number of pose iterations.")
+    parser.add_argument("--pose_iters", type=int, default=1000, help="Total number of pose iterations.")
     parser.add_argument("--object_name", type=str, default="006_mustard_bottle", help="Name of the object to load.")
     parser.add_argument("--object_density", type=float, default=2e0, help="Density of the object.")
     parser.add_argument("--verbose", action="store_true", help="Print out additional status messages during execution.")

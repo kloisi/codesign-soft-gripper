@@ -1,3 +1,5 @@
+# quick_viz.py
+
 import os
 import numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -121,15 +123,29 @@ def quick_visualize(tendon,
         n_proxy = 0
 
 
+    # enclosed volume stuff
+    dbg = getattr(tendon, "last_voxel_debug", None)
+    #P_block = dbg.get("blocked_pts") if dbg else None
+    P_enc   = dbg.get("enclosed_pts") if dbg else None
+    #n_block = 0 if P_block is None else len(P_block)
+    n_enc   = 0 if P_enc is None else len(P_enc)
+
+
+
     # base colours
     finger_color = np.array([0.2, 0.8, 0.2])  # green
     cloth_color  = np.array([0.9, 0.4, 0.1])  # orange
     obj_color    = np.array([0.2, 0.3, 1.0])  # blue
     proxy_color = np.array([0.6, 0.2, 0.9])  # purple
+    block_color = np.array([0.5, 0.5, 0.5])  # grey
+    enc_color   = np.array([1.0, 0.0, 0.0])  # red
+
 
     n_f = len(finger_ids)
     n_c = len(cloth_ids)
-    N = n_f + n_c + n_obj + n_proxy
+    #N = n_f + n_c + n_obj + n_proxy
+    #N = n_f + n_c + n_obj + n_proxy + n_block + n_enc
+    N = n_f + n_c + n_obj + n_proxy + n_enc
 
     if N == 0:
         print("quick viz: nothing to plot (no particles and no object points)")
@@ -143,6 +159,13 @@ def quick_visualize(tendon,
         colors[n_f+n_c:n_f+n_c+n_obj] = obj_color
     if n_proxy > 0:
         colors[n_f+n_c+n_obj:] = proxy_color
+
+    offset = n_f + n_c + n_obj + n_proxy
+    #if n_block > 0:
+        #colors[offset:offset+n_block] = block_color
+        #offset += n_block
+    if n_enc > 0:
+        colors[offset:offset+n_enc] = enc_color
 
 
     # --- highlight back-of-finger verts yellow ---
@@ -232,6 +255,12 @@ def quick_visualize(tendon,
 
         if n_proxy > 0:
             P_list.append(proxy_pts)  # frozen, identical every frame
+
+        #if n_block > 0:
+            #P_list.append(P_block.astype(np.float32))
+        if n_enc > 0:
+            P_list.append(P_enc.astype(np.float32))
+
 
 
 
@@ -354,4 +383,40 @@ def export_points_as_colored_cubes(points, colors, filename, half_size=0.005):
             f.write(f"3 {tri[0]} {tri[1]} {tri[2]}\n")
     
     print(f"quick_viz: Saved colored cubes PLY to {filename}")
+
+
+
+def plot_last_frame_with_voxels(tendon, dbg, save_path="debug/vox_overlay.png",
+                                point_size_particles=2, point_size_vox=6):
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    q = tendon.states[-1].particle_q.numpy()
+    if q.ndim == 3:
+        q = q[0]
+
+    P_block = dbg.get("blocked_pts", None)
+    P_enc = dbg.get("enclosed_pts", None)
+
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection="3d")
+
+    # particles
+    ax.scatter(q[:, 0], q[:, 2], q[:, 1], s=point_size_particles, alpha=0.10)
+
+    # blocked (make it much more visible than 0.1)
+    if P_block is not None and len(P_block) > 0:
+        ax.scatter(P_block[:, 0], P_block[:, 2], P_block[:, 1], s=0.1, alpha=0.35)
+
+    # enclosed
+    if P_enc is not None and len(P_enc) > 0:
+        ax.scatter(P_enc[:, 0], P_enc[:, 2], P_enc[:, 1], s=point_size_vox, alpha=0.9)
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path, dpi=200)
+    plt.close(fig)
+    print("saved overlay to", save_path)
+
+
 
