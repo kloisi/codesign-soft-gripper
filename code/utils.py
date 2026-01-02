@@ -1,3 +1,5 @@
+# utils.py
+
 import numpy as np
 import warp as wp
 from warp.sim.collide import mesh_sdf

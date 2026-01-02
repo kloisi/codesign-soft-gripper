@@ -374,7 +374,7 @@ class FEMTendon:
 
         # MW_ADDED, for enclosed volume, save log and print
         obj = self.ycb_object_name if self.ycb_object_name else "noobj"
-        self.vol_logger.to_csv(f"logs/volume_timeseries_{obj}.csv")
+        self.vol_logger.to_csv(f"logs/volume_timeseries_{obj}_f{self.finger_num}.csv")
 
         if self.verbose and (self.last_voxel_volume is not None):
             dbg = self.last_voxel_debug
