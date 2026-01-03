@@ -81,7 +81,7 @@ class FEMTendon:
                  ycb_object_name='',
                  object_density=1e1,
                  finger_len=9, finger_rot=np.pi/9, finger_width=0.08, scale=4.0, finger_transform=None,
-                 finger_num=2,
+                 finger_num=6,
                  requires_grad=True,
                  init_finger=None,
                  no_cloth=False):
