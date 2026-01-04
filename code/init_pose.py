@@ -183,6 +183,7 @@ class ForwardKinematics(torch.autograd.Function):
         utils.remove_nan(trans2d_grad)
         trans9d_grad.clamp_(-max_grad_trans, max_grad_trans)
         trans2d_grad.clamp_(-max_grad_trans, max_grad_trans)
+        #trans2d_grad.zero_()
         trans9d_grad[0].zero_()
         #trans9d_grad[1].zero_()
         trans9d_grad[2].zero_()
@@ -218,6 +219,7 @@ class InitializeFingers:
                  cloth_k=16,
                  cloth_alphas=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9),
                  cloth_margin_mult=1.0,
+                 fixed_radius=None,
                  ):
         self.pose_id = pose_id
         self.verbose = verbose
@@ -230,6 +232,7 @@ class InitializeFingers:
         self.num_envs = num_envs
         self.is_triangle = is_triangle
         self.add_random = add_random
+        self.fixed_radius = fixed_radius
 
         self.sim_substeps = 1
         self.sim_dt = self.frame_dt / self.sim_substeps
@@ -275,7 +278,7 @@ class InitializeFingers:
         # for arbitrary number of points (e.g. one value per finger)
         self.transform_2d_wp = wp.zeros(self.finger_num, dtype=wp.float32, requires_grad=True)
 
-        self.log = False
+        self.log = True
         # --- History Storage ---
         self.loss_history = []
         self.radius_history = []
@@ -437,6 +440,12 @@ class InitializeFingers:
         # contact/thickness-based limits (same for all prismatic joints for now)
         limit_low, limit_upp = -6 * finger_THK , 6 * finger_THK # was 6 * finger_THK
         self.limit_low, self.limit_upp = limit_low, limit_upp
+        if self.fixed_radius is not None:
+            needed_range = abs(self.fixed_radius) + 0.1 # Add buffer
+            if needed_range > self.limit_upp:
+                # print(f"[InitPose] Expanding limits from {self.limit_upp:.3f} to {needed_range:.3f} to accommodate fixed radius.")
+                self.limit_upp = needed_range
+                self.limit_low = -needed_range
         self.prismatic_limit = float(limit_upp) # store one number
 
         # add collision shapes for each finger
@@ -532,6 +541,8 @@ class InitializeFingers:
         Sweep a single shared radius value across all fingers.
         span is fraction of limit_upp around the current init value.
         """
+        if self.fixed_radius is not None:
+            return
         with torch.no_grad():
             span=0.6
             num=11
@@ -915,7 +926,7 @@ class InitializeFingers:
         use_com = True
 
         # NEW: sweep initial radius
-        self.sweep_R0(distance_param=distance_param, use_com=use_com)
+        #self.sweep_R0(distance_param=distance_param, use_com=use_com)
 
         for i in range(self.train_iter):
 
@@ -942,10 +953,10 @@ class InitializeFingers:
         if self.log:
             self.export_and_plot(threshold=convergence_threshold)
 
-        if self.loss.item() > 1.0:
-            print("Warning: Loss did not converge properly. Current loss:", self.loss.item())
-            self.init_count += 1
-            return None, None
+        # if self.loss.item() > 1.0:
+        #     print("Warning: Loss did not converge properly. Current loss:", self.loss.item())
+        #     self.init_count += 1
+        #     return None, None
 
         jq = self.model.joint_q.numpy()
         joint_trans = wp.transform(wp.vec3(jq[0], jq[1], jq[2]), 

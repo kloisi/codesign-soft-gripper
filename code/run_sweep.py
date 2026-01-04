@@ -18,6 +18,8 @@ def run_experiment_sweep():
     object_list = ["acropora_cervicornis", "acropora_florida", "acropora_loripes", "acropora_millepora", "acropora_nobilis", "acropora_palmata", "acropora_sarmentosa", "acropora_tenuis", "fungia_scutaria", "goniastrea_aspera", "montipora_capitata", "platygyra_daedalea", "platygyra_lamellina", "pocillopora_meandrina"]
     finger_counts = [3,4,5,6,7,8,9]
     #finger_counts = [3,4]
+
+    largest_radius = 1.6
     
     # Fixed parameters
     finger_len = 11
@@ -57,7 +59,8 @@ def run_experiment_sweep():
                         verbose=False,
                         finger_num=n_fingers,
                         add_random=False,
-                        consider_cloth=True
+                        consider_cloth=True,
+                        fixed_radius=largest_radius
                     )
                     
                     # Get the optimized transform
@@ -102,7 +105,7 @@ def run_experiment_sweep():
 
                     # Run L-BFGS Force Optimization
                     history = tendon.optimize_forces_lbfgs(
-                        iterations=2, # Keep low for testing, increase for real results
+                        iterations=1, # Keep low for testing, increase for real results
                         learning_rate=1.0, 
                         opt_frames=100
                     )

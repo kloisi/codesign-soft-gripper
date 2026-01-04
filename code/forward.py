@@ -306,7 +306,16 @@ class FEMTendon:
                 self.render_time += self.frame_dt
 
     def optimize_forces_lbfgs(self, iterations=10, learning_rate=1.0, opt_frames=10):
-        
+        # --- NEW DIAGNOSTIC CODE ---
+        print(f"\n[Mesh Info]")
+        total_particles = 0
+        for i, (start, end) in enumerate(self.builder.finger_vertex_ranges):
+            count = end - start
+            total_particles += count
+            print(f"  Finger {i}: {count} particles")
+        print(f"  Total Particles: {total_particles}")
+        print(f"---------------------------\n")
+        # ---------------------------
         max_force = 100.0
         # Perturb force by 1.0 Newton (much safer than perturbing latent by 5.0)
         delta_force = 1.0 
@@ -544,6 +553,7 @@ if __name__ == "__main__":
                 finger_num=args.finger_num,
                 add_random=args.random,
                 consider_cloth=not args.no_cloth,
+                fixed_radius=None
             )
 
             finger_transform, init_finger_q = init_finger.get_initial_position()
