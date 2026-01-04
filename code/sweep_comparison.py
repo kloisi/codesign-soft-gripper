@@ -625,7 +625,7 @@ def plot_from_optimization_file(csv_filename):
         text.set_color("white")
 
     # --- Save the File ---
-    plt.suptitle(f"Optimization Analysis: {method_name}", fontsize=20, color='white')
+    
     plt.tight_layout()
     
     plot_filename = f"{method_name}_plot_dark.png"
@@ -635,12 +635,97 @@ def plot_from_optimization_file(csv_filename):
     
     print(f"Plot saved to {plot_filename}")
 
+def plot_radius_optimization_dark(csv_filename="log_006_mustard_bottle_pose0.csv", object_name="Coral"):
+    # 1. Read the file
+    try:
+        df = pd.read_csv(csv_filename)
+    except FileNotFoundError:
+        print(f"Error: '{csv_filename}' not found.")
+        return
+
+    # 2. Setup Data
+    # Identify Finger Radius columns dynamically
+    radius_cols = [c for c in df.columns if 'Radius' in c]
+    num_fingers = len(radius_cols)
+
+    # --- Switch to Dark Background Style ---
+    plt.style.use('dark_background')
+
+    # 3. Create Figure
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 7))
+    fig.patch.set_facecolor('black')
+
+    # --- Plot A: Loss (Cyan Style, Log Scale) ---
+    ax1.plot(df["Iteration"], df["Loss"], color='#00FFFF', linewidth=2.5, label="Loss")
+    
+    # Log scale specific logic
+    ax1.set_yscale('log')
+    
+    # Styling Ax1
+    ax1.set_facecolor('black')
+    ax1.set_title(f"Optimization Loss", fontsize=16, fontweight='bold', color='white')
+    ax1.set_xlabel("Iterations", fontsize=14, color='white')
+    ax1.set_ylabel("Loss (Log Scale)", fontsize=14, color='white')
+    ax1.tick_params(axis='both', colors='white', labelsize=12, which='both')
+    
+    # Grid for log scale (major and minor)
+    ax1.grid(True, which="major", linestyle='--', alpha=0.4, color='gray')
+    ax1.grid(True, which="minor", linestyle=':', alpha=0.2, color='gray')
+    
+    for spine in ax1.spines.values():
+        spine.set_edgecolor('white')
+        
+    legend1 = ax1.legend(facecolor='black', edgecolor='white')
+    for text in legend1.get_texts():
+        text.set_color("white")
+
+    # --- Plot B: Finger Radii (Multi-Color/Neon Style) ---
+    # Generate high contrast colors
+    colors = ['#00FFFF', '#FFD700', '#32CD32', '#FF00FF']
+    
+    for i, col in enumerate(radius_cols):
+        # Extract finger index from header "Finger_0_Radius"
+        parts = col.split('_')
+        f_idx = parts[1] if len(parts) > 1 else str(i)
+        
+        ax2.plot(df["Iteration"], df[col], 
+                label=f"Finger {f_idx}", color=colors[i], linewidth=2.0, alpha=0.9)
+
+    # Styling Ax2
+    ax2.set_facecolor('black')
+    ax2.set_title(f"Finger Radius Optimization", fontsize=16, fontweight='bold', color='white')
+    ax2.set_xlabel("Iterations", fontsize=14, color='white')
+    ax2.set_ylabel("Radius (meters)", fontsize=14, color='white')
+    ax2.tick_params(axis='both', colors='white', labelsize=12)
+    ax2.grid(True, linestyle='--', alpha=0.3, color='gray')
+
+    for spine in ax2.spines.values():
+        spine.set_edgecolor('white')
+
+    # Legend for Ax2
+    legend2 = ax2.legend(loc='best', facecolor='black', edgecolor='white')
+    for text in legend2.get_texts():
+        text.set_color("white")
+
+    # --- Save the File ---
+
+    plt.tight_layout()
+    
+    safe_name = object_name.replace(" ", "_").lower()
+    plot_filename = f"plot_radius_{safe_name}_dark.png"
+    
+    plt.savefig(plot_filename, dpi=150, facecolor=fig.get_facecolor(), edgecolor='none')
+    plt.close()
+    
+    print(f"Plot saved to {plot_filename}")
+
 if __name__ == "__main__":
     #compare_four_sweeps()
     #compare_finger_counts(pd.read_csv('all_sweeps_merged.csv'))
     #analyze_fingers_force(pd.read_csv('all_sweeps_merged.csv'))
-    #recalculate_true_loss('all_sweeps_merged.csv')
+    recalculate_true_loss('all_sweeps_merged.csv')
     compare_recalculated_sweeps('all_sweeps_recalculated.csv')
     plot_sweeps_no_radius()
     save_separate_run_plots('all_sweeps_recalculated.csv')
     plot_from_optimization_file('lbfgs_results.csv')
+    plot_radius_optimization_dark('log_006_mustard_bottle_pose0.csv', object_name=' ')
