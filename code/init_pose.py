@@ -278,7 +278,7 @@ class InitializeFingers:
         # for arbitrary number of points (e.g. one value per finger)
         self.transform_2d_wp = wp.zeros(self.finger_num, dtype=wp.float32, requires_grad=True)
 
-        self.log = True
+        self.log = False
         # --- History Storage ---
         self.loss_history = []
         self.radius_history = []
@@ -926,7 +926,7 @@ class InitializeFingers:
         use_com = True
 
         # NEW: sweep initial radius
-        #self.sweep_R0(distance_param=distance_param, use_com=use_com)
+        self.sweep_R0(distance_param=distance_param, use_com=use_com)
 
         for i in range(self.train_iter):
 
