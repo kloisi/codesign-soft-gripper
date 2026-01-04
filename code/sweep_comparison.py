@@ -194,8 +194,453 @@ def analyze_fingers_force(df):
     plt.savefig(output_filename)
     print(f"\nForce analysis plot saved to '{output_filename}'")
 
+def recalculate_true_loss(file_path='all_sweeps_merged.csv'):
+    # 1. Load Data
+    df = pd.read_csv(file_path)
+    
+    # 2. Configuration based on your experiments
+    # (Label, Column Suffix, Force Scale)
+    configs = [
+        ('Fixed 100N', 'Fixed Force 100N', 0.005),
+        ('Fixed 50N',  'Fixed Force 50N',  0.005),
+        ('Weak Opt',   'Weak Force Penalty', 0.005),
+        ('Strong Opt', 'Strong Force Penalty', 0.01)
+    ]
+    
+    print(f"{'Method':<15} | {'Orig Loss':<10} | {'True Dist Loss':<15}")
+    print("-" * 45)
+    
+    results = []
+
+    for label, suffix, weight in configs:
+        loss_col = f'Loss_{suffix}'
+        force_col = f'Force_{suffix}'
+        
+        # Calculate the Penalty Term
+        # Formula: weight * mean(Force^2)
+        # We approximate mean(Force^2) as Avg_Force^2 
+        # (This is exact for fixed forces and very close for optimized ones)
+        penalty_term = weight * (df[force_col] ** 2)
+        
+        # Subtract penalty to get the pure Distance Term
+        dist_term = df[loss_col] - penalty_term
+        
+        # Save results
+        df[f'True_Loss_{suffix}'] = dist_term
+        results.append({
+            'Method': label, 
+            'Avg': dist_term.mean()
+        })
+        
+        print(f"{label:<15} | {df[loss_col].mean():<10.2f} | {dist_term.mean():<15.2f}")
+
+    # Optional: Save to new CSV
+    df.to_csv('all_sweeps_recalculated.csv', index=False)
+    print("\nDetailed results saved to 'all_sweeps_recalculated.csv'")
+
+def compare_recalculated_sweeps(file_path='all_sweeps_recalculated.csv'):
+    # 1. Load the pre-calculated data
+    try:
+        df = pd.read_csv(file_path)
+    except FileNotFoundError:
+        print(f"Error: File '{file_path}' not found. Please run the recalculation script first.")
+        return
+
+    # 2. Define the methods/suffixes to compare
+    methods = [
+        'Fixed Force 100N', 
+        'Fixed Force 50N', 
+        'Weak Force Penalty', 
+        'Strong Force Penalty'
+    ]
+
+    # 3. Visualization Data Prep
+    plot_data = []
+    for index, row in df.iterrows():
+        for method in methods:
+            loss_col = f'True_Loss_{method}'
+            force_col = f'Force_{method}'
+            
+            if loss_col in df.columns and force_col in df.columns:
+                plot_data.append({
+                    'Method': method,
+                    'True Loss': row[loss_col],
+                    'Average Force': row[force_col]
+                })
+    
+    plot_df = pd.DataFrame(plot_data)
+
+    # --- Switch to Dark Background Style ---
+    plt.style.use('dark_background')
+
+    # 4. Plotting
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    fig.patch.set_facecolor('black')
+    
+    # High contrast palette: Cyan, Gold, Lime, Magenta
+    custom_palette = ['#00FFFF', '#FFD700', '#32CD32', '#FF00FF']
+
+    # --- Plot A: True Loss Distribution ---
+    sns.boxplot(
+        data=plot_df, 
+        x='Method', 
+        y='True Loss', 
+        order=methods,
+        palette=custom_palette,
+        ax=axes[0], 
+        showfliers=False
+    )
+    
+    # Styling Plot A
+    axes[0].set_facecolor('black')
+    axes[0].set_title('Comparison of Distance Loss', fontsize=14, fontweight='bold', color='white')
+    axes[0].set_ylabel('Distance Loss', fontsize=12, color='white')
+    axes[0].set_xlabel('')
+    axes[0].tick_params(axis='x', rotation=15, colors='white', labelsize=10)
+    axes[0].tick_params(axis='y', colors='white', labelsize=10)
+    axes[0].grid(True, linestyle='--', alpha=0.3, color='gray')
+    for spine in axes[0].spines.values():
+        spine.set_edgecolor('white')
+
+    # --- Plot B: Force Distribution ---
+    sns.boxplot(
+        data=plot_df, 
+        x='Method', 
+        y='Average Force', 
+        order=methods,
+        palette=custom_palette,
+        ax=axes[1]
+    )
+    
+    # Styling Plot B
+    axes[1].set_facecolor('black')
+    axes[1].set_title('Comparison of Applied Forces', fontsize=14, fontweight='bold', color='white')
+    axes[1].set_ylabel('Force (N)', fontsize=12, color='white')
+    axes[1].set_xlabel('')
+    axes[1].tick_params(axis='x', rotation=15, colors='white', labelsize=10)
+    axes[1].tick_params(axis='y', colors='white', labelsize=10)
+    axes[1].grid(True, linestyle='--', alpha=0.3, color='gray')
+    for spine in axes[1].spines.values():
+        spine.set_edgecolor('white')
+    
+    # Add benchmarks
+    axes[1].axhline(y=50, color='#FF4500', linestyle='--', alpha=0.8, label='50N Ref') # OrangeRed
+    axes[1].axhline(y=100, color='#A9A9A9', linestyle='--', alpha=0.8, label='100N Ref') # LightGray
+    
+    legend = axes[1].legend(facecolor='black', edgecolor='white')
+    for text in legend.get_texts():
+        text.set_color("white")
+
+    plt.tight_layout()
+    output_file = 'recalculated_sweeps_comparison_dark.png'
+    plt.savefig(output_file, facecolor=fig.get_facecolor(), edgecolor='none')
+    print(f"\nComparison plot saved as '{output_file}'")
+
+def plot_sweeps_no_radius():
+    # 1. Load data
+    try:
+        df = pd.read_csv('all_sweeps_recalculated.csv')
+    except FileNotFoundError:
+        print("Error: 'all_sweeps_recalculated.csv' not found.")
+        return
+
+    # 2. Define methods to extract
+    methods = [
+        'Fixed Force 100N',
+        'Fixed Force 50N',
+        'Weak Force Penalty',
+        'Strong Force Penalty'
+    ]
+
+    # 3. Reshape to long format
+    long_dfs = []
+    for method in methods:
+        loss_col = f'True_Loss_{method}'
+        force_col = f'Force_{method}'
+        
+        # Check if columns exist
+        if loss_col in df.columns and force_col in df.columns:
+            temp_df = df[['Object', 'Num_Fingers', loss_col, force_col]].copy()
+            temp_df.rename(columns={
+                loss_col: 'True_Loss',
+                force_col: 'Avg_Force'
+            }, inplace=True)
+            temp_df['Method'] = method
+            long_dfs.append(temp_df)
+    
+    if not long_dfs:
+        print("No matching columns found.")
+        return
+
+    plot_df = pd.concat(long_dfs, ignore_index=True)
+
+    # --- Switch to Dark Background Style ---
+    plt.style.use('dark_background')
+
+    # 4. Plotting
+    # Create figure with explicit black background
+    fig, axes = plt.subplots(1, 2, figsize=(20, 8))
+    fig.patch.set_facecolor('black')
+
+    # Define a high-contrast palette for the dark background
+    # Fixed 100N (Cyan), Fixed 50N (Gold), Weak (Lime), Strong (Magenta)
+    custom_palette = ['#00FFFF', '#FFD700', '#32CD32', '#FF00FF']
+    
+    # --- Plot 1: True Loss vs Fingers ---
+    sns.lineplot(
+        data=plot_df, 
+        x="Num_Fingers", 
+        y="True_Loss", 
+        hue="Method", 
+        palette=custom_palette,
+        marker="o", 
+        errorbar='sd', 
+        ax=axes[0], 
+        linewidth=2.5
+    )
+    
+    # Styling Plot 1
+    axes[0].set_facecolor('black')
+    axes[0].set_title("Distance Loss (Mean ± Std Dev)", fontsize=16, fontweight='bold', color='white')
+    axes[0].set_ylabel("Distance Loss", fontsize=14, color='white')
+    axes[0].set_xlabel("Number of Fingers", fontsize=14, color='white')
+    axes[0].tick_params(axis='both', colors='white', labelsize=12)
+    axes[0].grid(True, linestyle='--', alpha=0.3, color='gray')
+    for spine in axes[0].spines.values():
+        spine.set_edgecolor('white')
+    
+    # Legend Plot 1
+    legend = axes[0].legend(facecolor='black', edgecolor='white', title='Method', title_fontsize=12)
+    plt.setp(legend.get_title(), color='white')
+    for text in legend.get_texts():
+        text.set_color("white")
+
+
+    # --- Plot 2: Average Force vs Fingers ---
+    sns.lineplot(
+        data=plot_df, 
+        x="Num_Fingers", 
+        y="Avg_Force", 
+        hue="Method", 
+        palette=custom_palette,
+        marker="o", 
+        errorbar='sd', 
+        ax=axes[1], 
+        linewidth=2.5
+    )
+
+    # Styling Plot 2
+    axes[1].set_facecolor('black')
+    axes[1].set_title("Average Force (Mean ± Std Dev)", fontsize=16, fontweight='bold', color='white')
+    axes[1].set_ylabel("Force (N)", fontsize=14, color='white')
+    axes[1].set_xlabel("Number of Fingers", fontsize=14, color='white')
+    axes[1].tick_params(axis='both', colors='white', labelsize=12)
+    axes[1].grid(True, linestyle='--', alpha=0.3, color='gray')
+    for spine in axes[1].spines.values():
+        spine.set_edgecolor('white')
+    
+    # Benchmarks for Force
+    axes[1].axhline(50, color='#FF4500', linestyle='--', alpha=0.8, label='50N Ref') # OrangeRed
+    axes[1].axhline(100, color='#A9A9A9', linestyle='--', alpha=0.8, label='100N Ref') # LightGray
+    
+    # Legend Plot 2
+    legend2 = axes[1].legend(facecolor='black', edgecolor='white', title='Method', title_fontsize=12)
+    plt.setp(legend2.get_title(), color='white')
+    for text in legend2.get_texts():
+        text.set_color("white")
+
+    plt.tight_layout()
+    output_filename = 'sweep_analysis_loss_force_dark.png'
+    plt.savefig(output_filename, facecolor=fig.get_facecolor(), edgecolor='none')
+    print(f"Plots saved to {output_filename}")
+
+def save_separate_run_plots(file_path='all_sweeps_recalculated.csv'):
+    # 1. Load Data
+    try:
+        df = pd.read_csv(file_path)
+    except FileNotFoundError:
+        print(f"Error: '{file_path}' not found.")
+        return
+
+    # 2. Define the methods to process
+    methods = [
+        'Fixed Force 100N',
+        'Fixed Force 50N',
+        'Weak Force Penalty',
+        'Strong Force Penalty'
+    ]
+
+    # --- Switch to Dark Background Style ---
+    plt.style.use('dark_background')
+
+    # 3. Loop through each method and create a separate file
+    for method in methods:
+        loss_col = f'True_Loss_{method}'
+        force_col = f'Force_{method}'
+
+        # Check if columns exist
+        if loss_col in df.columns and force_col in df.columns:
+            # Create figure with explicit black background
+            fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+            fig.patch.set_facecolor('black')
+            
+            # --- Subplot 1: True Loss ---
+            # Use bright Cyan (#00FFFF) for visibility
+            sns.lineplot(
+                data=df, 
+                x="Num_Fingers", 
+                y=loss_col, 
+                marker="o", 
+                errorbar='sd', 
+                ax=axes[0],
+                color='#00FFFF', 
+                linewidth=2.5
+            )
+            # Customize axis colors
+            axes[0].set_facecolor('black')
+            axes[0].set_title(f"{method}: Distance Loss (Mean ± Std Dev)", fontsize=16, fontweight='bold', color='white')
+            axes[0].set_ylabel("Distance Loss", fontsize=14, color='white')
+            axes[0].set_xlabel("Number of Fingers", fontsize=14, color='white')
+            axes[0].tick_params(axis='both', colors='white', labelsize=12)
+            axes[0].grid(True, linestyle='--', alpha=0.3, color='gray')
+            for spine in axes[0].spines.values():
+                spine.set_edgecolor('white')
+
+            # --- Subplot 2: Average Force ---
+            # Use bright Gold (#FFD700) for visibility
+            sns.lineplot(
+                data=df, 
+                x="Num_Fingers", 
+                y=force_col, 
+                marker="o", 
+                errorbar='sd', 
+                ax=axes[1],
+                color='#FFD700', 
+                linewidth=2.5
+            )
+            axes[1].set_facecolor('black')
+            axes[1].set_title(f"{method}: Average Force (Mean ± Std Dev)", fontsize=16, fontweight='bold', color='white')
+            axes[1].set_ylabel("Force (N)", fontsize=14, color='white')
+            axes[1].set_xlabel("Number of Fingers", fontsize=14, color='white')
+            axes[1].tick_params(axis='both', colors='white', labelsize=12)
+            axes[1].grid(True, linestyle='--', alpha=0.3, color='gray')
+            for spine in axes[1].spines.values():
+                spine.set_edgecolor('white')
+
+            # Add benchmarks with bright colors
+            axes[1].axhline(50, color='#FF4500', linestyle='--', alpha=0.8, label='50N Ref') # OrangeRed
+            axes[1].axhline(100, color='#A9A9A9', linestyle='--', alpha=0.8, label='100N Ref') # LightGray
+            
+            # Legend customization
+            legend = axes[1].legend(facecolor='black', edgecolor='white')
+            for text in legend.get_texts():
+                text.set_color("white")
+
+            # --- Save the File ---
+            safe_name = method.replace(" ", "_").lower()
+            filename = f"plot_{safe_name}_dark.png"
+            
+            plt.suptitle(f"Analysis: {method}", fontsize=20, color='white')
+            plt.tight_layout()
+            # Ensure saved image retains the black background
+            plt.savefig(filename, facecolor=fig.get_facecolor(), edgecolor='none')
+            plt.close() 
+            
+            print(f"Saved plot to: {filename}")
+        else:
+            print(f"Skipping {method} (Columns not found)")
+
+def plot_from_optimization_file(csv_filename):
+# 1. Read the file
+    try:
+        df = pd.read_csv(csv_filename)
+    except FileNotFoundError:
+        print(f"Error: '{csv_filename}' not found.")
+        return
+
+    # 2. Setup Data
+    method_name = "LBFGS"
+    force_cols = [c for c in df.columns if c.startswith('Force_')]
+    num_tendons = len(force_cols)
+
+    # --- Switch to Dark Background Style ---
+    plt.style.use('dark_background')
+
+    # 3. Create Figure
+    # Using the larger figsize from your design example
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 7))
+    fig.patch.set_facecolor('black')
+
+    # --- Plot A: Loss (Cyan Style) ---
+    # Using #00FFFF (Cyan) as requested in the design
+    ax1.plot(df["Iteration"], df["Loss"], marker='o', color='#00FFFF', linewidth=2.5, label="Loss")
+    
+    # Styling Ax1
+    ax1.set_facecolor('black')
+    ax1.set_title(f"{method_name}: Loss Convergence", fontsize=16, fontweight='bold', color='white')
+    ax1.set_xlabel("Iteration", fontsize=14, color='white')
+    ax1.set_ylabel("Total Loss", fontsize=14, color='white')
+    ax1.tick_params(axis='both', colors='white', labelsize=12)
+    ax1.grid(True, linestyle='--', alpha=0.3, color='gray')
+    
+    # Set spines to white
+    for spine in ax1.spines.values():
+        spine.set_edgecolor('white')
+        
+    # Legend for Ax1
+    legend1 = ax1.legend(facecolor='black', edgecolor='white')
+    for text in legend1.get_texts():
+        text.set_color("white")
+
+    # --- Plot B: Forces (Multi-Color/Neon Style) ---
+    # We generate a colormap that pops against black (using 'hsv' or 'jet' for high contrast)
+    colors = ['#00FFFF', '#FFD700', '#32CD32', '#FF00FF']
+    
+    for i, col in enumerate(force_cols):
+        t_idx = col.split('_')[1] 
+        ax2.plot(df["Iteration"], df[col], 
+                label=f"Tendon {t_idx}", color=colors[i], linewidth=2.0, alpha=0.9)
+
+    # Styling Ax2
+    ax2.set_facecolor('black')
+    ax2.set_title(f"{method_name}: Force Trajectories", fontsize=16, fontweight='bold', color='white')
+    ax2.set_xlabel("Iteration", fontsize=14, color='white')
+    ax2.set_ylabel("Force (N)", fontsize=14, color='white')
+    ax2.tick_params(axis='both', colors='white', labelsize=12)
+    ax2.grid(True, linestyle='--', alpha=0.3, color='gray')
+
+    # Set spines to white
+    for spine in ax2.spines.values():
+        spine.set_edgecolor('white')
+
+    # Legend for Ax2 (Handling placement and dark theme)
+    if num_tendons <= 5:
+        legend2 = ax2.legend(loc='best', facecolor='black', edgecolor='white')
+    else:
+        legend2 = ax2.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), 
+                             fontsize='small', facecolor='black', edgecolor='white')
+    
+    # Fix legend text color
+    for text in legend2.get_texts():
+        text.set_color("white")
+
+    # --- Save the File ---
+    plt.suptitle(f"Optimization Analysis: {method_name}", fontsize=20, color='white')
+    plt.tight_layout()
+    
+    plot_filename = f"{method_name}_plot_dark.png"
+    # Ensure saved image retains the black background
+    plt.savefig(plot_filename, dpi=150, facecolor=fig.get_facecolor(), edgecolor='none')
+    plt.close()
+    
+    print(f"Plot saved to {plot_filename}")
 
 if __name__ == "__main__":
     #compare_four_sweeps()
     #compare_finger_counts(pd.read_csv('all_sweeps_merged.csv'))
-    analyze_fingers_force(pd.read_csv('all_sweeps_merged.csv'))
+    #analyze_fingers_force(pd.read_csv('all_sweeps_merged.csv'))
+    #recalculate_true_loss('all_sweeps_merged.csv')
+    compare_recalculated_sweeps('all_sweeps_recalculated.csv')
+    plot_sweeps_no_radius()
+    save_separate_run_plots('all_sweeps_recalculated.csv')
+    plot_from_optimization_file('lbfgs_results.csv')
