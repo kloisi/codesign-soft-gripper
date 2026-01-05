@@ -1,279 +1,847 @@
 # plot_dt_sweep.py
+#
+# Load dt sweep NPZ logs produced by sweep_dt.py and generate plots.
+#
+# Expected inputs (default paths relative to this script):
+#   - dt_sweep_data/run_rep??_fps*_sub*_seed*.npz
+#   - dt_sweep_data/sweep_meta.json  (optional, used for context)
+#
+# Outputs (default):
+#   - dt_sweep_plots/*.png
+#   - dt_sweep_plots/summary_table.csv
+#
+# NOTE (added):
+#   - For each plot, we now ALSO save a 2nd "presentation" PNG:
+#       same name + "_presentation.png"
+#     with black background, thicker lines, and larger text.
+#   - The original plots are saved exactly as before.
+#
+# Usage examples:
+#   python plot_dt_sweep.py
+#   python plot_dt_sweep.py --data_dir dt_sweep_data --out_dir dt_sweep_plots --show
+#   python plot_dt_sweep.py --ref sub=20
+#   python plot_dt_sweep.py --ref file=dt_sweep_data/run_rep01_fps4000_sub50_seed12346.npz
+
+from __future__ import annotations
 
 import os
+import json
+import glob
+import argparse
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 
 
-CSV_PATH = "dt_sweep_results_forwardlike.csv"  # change if needed
-OUT_DIR = "dt_sweep_plots_forwardlike"
-os.makedirs(OUT_DIR, exist_ok=True)
+# -------------------------
+# Utilities
+# -------------------------
+def _safe_float(x, default=np.nan) -> float:
+    if x is None:
+        return float(default)
+    try:
+        return float(x)
+    except Exception:
+        return float(default)
 
 
-def to_num(df, cols):
-    for c in cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+def _safe_int(x, default=-1) -> int:
+    if x is None:
+        return int(default)
+    try:
+        return int(x)
+    except Exception:
+        return int(default)
 
 
-def savefig(path):
-    plt.tight_layout()
-    plt.savefig(path, dpi=200)
+def _safe_bool(x, default=False) -> bool:
+    if x is None:
+        return bool(default)
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, (int, np.integer)):
+        return bool(int(x))
+    if isinstance(x, str):
+        return x.strip().lower() in ["1", "true", "yes", "y", "ok"]
+    return bool(x)
+
+
+def _load_json_scalar(arr) -> Dict[str, Any]:
+    """
+    sweep_dt.py stored dicts as json strings inside npz:
+      meta_json=np.array(json_string)
+    so this comes out as a 0d numpy array or string.
+    """
+    if arr is None:
+        return {}
+    try:
+        if isinstance(arr, np.ndarray):
+            s = arr.item()
+        else:
+            s = arr
+        if isinstance(s, bytes):
+            s = s.decode("utf-8", errors="replace")
+        return json.loads(str(s))
+    except Exception:
+        return {}
+
+
+def _interp_rmse(
+    t_ref: np.ndarray,
+    y_ref: np.ndarray,
+    t_run: np.ndarray,
+    y_run: np.ndarray,
+    t0: float,
+    t1: float,
+    n: int = 400,
+) -> float:
+    if t_ref.size < 2 or t_run.size < 2:
+        return float("nan")
+    t0 = float(t0)
+    t1 = float(t1)
+    if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
+        return float("nan")
+    grid = np.linspace(t0, t1, int(n))
+    y_ref_i = np.interp(grid, t_ref, y_ref)
+    y_run_i = np.interp(grid, t_run, y_run)
+    return float(np.sqrt(np.mean((y_run_i - y_ref_i) ** 2)))
+
+
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def _apply_presentation_style(fig, font_scale=1.35, line_scale=1.8, marker_scale=1.35) -> None:
+    """
+    Mutates the current figure to be more PPT friendly:
+      - black background
+      - larger fonts
+      - thicker lines / larger markers
+      - white text/ticks/spines
+    """
+    try:
+        fig.patch.set_facecolor("black")
+    except Exception:
+        pass
+
+    # Slightly larger canvas (only affects presentation save because we call after original save)
+    try:
+        w, h = fig.get_size_inches()
+        fig.set_size_inches(w * 1.08, h * 1.08, forward=True)
+    except Exception:
+        pass
+
+    for ax in fig.get_axes():
+        # Axes background
+        try:
+            ax.set_facecolor("black")
+        except Exception:
+            pass
+
+        # Spines
+        try:
+            for sp in ax.spines.values():
+                sp.set_color("white")
+                sp.set_linewidth(max(1.0, float(sp.get_linewidth()) * 1.1))
+        except Exception:
+            pass
+
+        # Titles/labels
+        try:
+            ax.title.set_color("white")
+            ax.title.set_fontsize(float(ax.title.get_fontsize()) * font_scale)
+        except Exception:
+            pass
+
+        try:
+            ax.xaxis.label.set_color("white")
+            ax.yaxis.label.set_color("white")
+            ax.xaxis.label.set_fontsize(float(ax.xaxis.label.get_fontsize()) * font_scale)
+            ax.yaxis.label.set_fontsize(float(ax.yaxis.label.get_fontsize()) * font_scale)
+        except Exception:
+            pass
+
+        # Ticks
+        try:
+            ax.tick_params(axis="both", which="both", colors="white")
+            for lab in ax.get_xticklabels() + ax.get_yticklabels():
+                try:
+                    lab.set_color("white")
+                    lab.set_fontsize(float(lab.get_fontsize()) * font_scale)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Grid
+        try:
+            for gl in ax.get_xgridlines() + ax.get_ygridlines():
+                gl.set_color("white")
+                gl.set_alpha(0.20)
+                gl.set_linewidth(max(0.8, float(gl.get_linewidth()) * 1.1))
+        except Exception:
+            pass
+
+        # Lines
+        try:
+            for ln in ax.get_lines():
+                try:
+                    lw = float(ln.get_linewidth())
+                    ln.set_linewidth(max(1.4, lw * line_scale))
+                except Exception:
+                    pass
+                try:
+                    ms = ln.get_markersize()
+                    if ms is not None and float(ms) > 0:
+                        ln.set_markersize(float(ms) * marker_scale)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Scatter/collections (markers)
+        try:
+            for coll in ax.collections:
+                try:
+                    sz = coll.get_sizes()
+                    if sz is not None and len(sz):
+                        coll.set_sizes(np.asarray(sz, dtype=float) * (marker_scale ** 2))
+                except Exception:
+                    pass
+                try:
+                    lw = coll.get_linewidths()
+                    if lw is not None and len(lw):
+                        coll.set_linewidths(np.maximum(1.0, np.asarray(lw, dtype=float) * line_scale))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Annotation/text
+        try:
+            for t in ax.texts:
+                try:
+                    t.set_color("white")
+                    t.set_fontsize(float(t.get_fontsize()) * font_scale)
+                    if t.get_bbox_patch() is None:
+                        t.set_bbox(dict(facecolor="black", alpha=0.35, edgecolor="none", pad=0.4))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Legend
+        try:
+            leg = ax.get_legend()
+            if leg is not None:
+                try:
+                    frame = leg.get_frame()
+                    frame.set_facecolor("black")
+                    frame.set_edgecolor("white")
+                    frame.set_alpha(0.65)
+                except Exception:
+                    pass
+                try:
+                    for txt in leg.get_texts():
+                        txt.set_color("white")
+                        txt.set_fontsize(float(txt.get_fontsize()) * font_scale)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
+def _save_fig(out_dir: str, name: str) -> None:
+    """
+    Saves:
+      1) original PNG exactly as before: {name}.png
+      2) presentation PNG: {name}_presentation.png (black bg, thicker lines, larger text)
+    """
+    _ensure_dir(out_dir)
+
+    # 1) Original (unchanged)
+    png = os.path.join(out_dir, f"{name}.png")
+    plt.savefig(png, dpi=200, bbox_inches="tight")
+
+    # 2) Presentation version
+    fig = plt.gcf()
+    _apply_presentation_style(fig)
+    png_pres = os.path.join(out_dir, f"{name}_presentation.png")
+    plt.savefig(
+        png_pres,
+        dpi=220,
+        bbox_inches="tight",
+        facecolor=fig.get_facecolor(),
+        edgecolor="none",
+    )
+
+
+# -------------------------
+# Data structures
+# -------------------------
+@dataclass
+class Run:
+    path: str
+    meta: Dict[str, Any]
+    stats: Dict[str, Any]
+
+    # arrays (may be empty)
+    vol_t: np.ndarray
+    vol_v: np.ndarray
+    q_end: np.ndarray
+    qd_end: np.ndarray
+    body_q0: np.ndarray
+    body_q_end: np.ndarray
+
+    # convenience
+    fps: int
+    sub: int
+    rep: int
+    seed: int
+    sim_dt: float
+    frame_dt: float
+    T_target: float
+    total_steps: int
+
+    # key stats
+    t_forward_s: float
+    real_time_per_step_ms: float
+    num_ok: bool
+    phys_ok: bool
+    max_speed: float
+    max_abs_pos: float
+    vol_final: float
+
+
+# -------------------------
+# Loading NPZ runs
+# -------------------------
+def load_runs(data_dir: str) -> List[Run]:
+    pattern = os.path.join(data_dir, "run_rep*_fps*_sub*_seed*.npz")
+    files = sorted(glob.glob(pattern))
+    if not files:
+        raise FileNotFoundError(f"No NPZ files found at: {pattern}")
+
+    runs: List[Run] = []
+    for p in files:
+        try:
+            with np.load(p, allow_pickle=True) as z:
+                meta = _load_json_scalar(z.get("meta_json", None))
+                stats = _load_json_scalar(z.get("stats_json", None))
+
+                vol_t = np.asarray(z.get("vol_t", np.array([], dtype=np.float64)), dtype=np.float64)
+                vol_v = np.asarray(z.get("vol_v", np.array([], dtype=np.float64)), dtype=np.float64)
+
+                q_end = np.asarray(z.get("q_end", np.array([], dtype=np.float64)), dtype=np.float64)
+                qd_end = np.asarray(z.get("qd_end", np.array([], dtype=np.float64)), dtype=np.float64)
+                body_q0 = np.asarray(z.get("body_q0", np.array([], dtype=np.float64)), dtype=np.float64)
+                body_q_end = np.asarray(z.get("body_q_end", np.array([], dtype=np.float64)), dtype=np.float64)
+
+            fps = _safe_int(meta.get("fps", None), -1)
+            sub = _safe_int(meta.get("sim_substeps", None), -1)
+            rep = _safe_int(meta.get("rep", None), -1)
+            seed = _safe_int(meta.get("kernel_seed", None), -1)
+            sim_dt = _safe_float(meta.get("sim_dt", None), np.nan)
+            frame_dt = _safe_float(meta.get("frame_dt", None), np.nan)
+            T_target = _safe_float(meta.get("T_target", None), np.nan)
+            total_steps = _safe_int(meta.get("total_steps", None), -1)
+
+            t_forward_s = _safe_float(stats.get("t_forward_s", None), np.nan)
+            real_time_per_step_ms = _safe_float(stats.get("real_time_per_step_ms", None), np.nan)
+            num_ok = _safe_bool(stats.get("num_ok", None), False)
+            phys_ok = _safe_bool(stats.get("phys_ok", None), False)
+            max_speed = _safe_float(stats.get("max_speed", None), np.nan)
+            max_abs_pos = _safe_float(stats.get("max_abs_pos", None), np.nan)
+            vol_final = _safe_float(stats.get("vol_final", None), np.nan)
+
+            runs.append(
+                Run(
+                    path=p,
+                    meta=meta,
+                    stats=stats,
+                    vol_t=vol_t,
+                    vol_v=vol_v,
+                    q_end=q_end,
+                    qd_end=qd_end,
+                    body_q0=body_q0,
+                    body_q_end=body_q_end,
+                    fps=fps,
+                    sub=sub,
+                    rep=rep,
+                    seed=seed,
+                    sim_dt=sim_dt,
+                    frame_dt=frame_dt,
+                    T_target=T_target,
+                    total_steps=total_steps,
+                    t_forward_s=t_forward_s,
+                    real_time_per_step_ms=real_time_per_step_ms,
+                    num_ok=num_ok,
+                    phys_ok=phys_ok,
+                    max_speed=max_speed,
+                    max_abs_pos=max_abs_pos,
+                    vol_final=vol_final,
+                )
+            )
+        except Exception as e:
+            print(f"[WARN] Failed to load {p}: {type(e).__name__}: {e}")
+
+    if not runs:
+        raise RuntimeError("All NPZ loads failed.")
+    return runs
+
+
+# -------------------------
+# Reference selection
+# -------------------------
+def pick_reference(runs: List[Run], ref_spec: str) -> Run:
+    ok_runs = [r for r in runs if r.num_ok and r.phys_ok and np.isfinite(r.sim_dt)]
+    if not ok_runs:
+        ok_runs = [r for r in runs if np.isfinite(r.sim_dt)]
+    if not ok_runs:
+        raise RuntimeError("No runs with finite sim_dt found.")
+
+    ref_spec = (ref_spec or "").strip().lower()
+    if ref_spec in ["", "min_dt", "mindt", "auto"]:
+        # smallest dt among ok runs
+        ok_runs = sorted(ok_runs, key=lambda r: (r.sim_dt, r.rep, r.sub))
+        return ok_runs[0]
+
+    if ref_spec.startswith("sub="):
+        target_sub = int(ref_spec.split("=", 1)[1])
+        cand = [r for r in ok_runs if r.sub == target_sub]
+        if not cand:
+            raise ValueError(f"No runs found with sub={target_sub}")
+        cand = sorted(cand, key=lambda r: (r.rep, r.sim_dt))
+        return cand[0]
+
+    if ref_spec.startswith("rep="):
+        target_rep = int(ref_spec.split("=", 1)[1])
+        cand = [r for r in ok_runs if r.rep == target_rep]
+        if not cand:
+            raise ValueError(f"No runs found with rep={target_rep}")
+        cand = sorted(cand, key=lambda r: (r.sim_dt, r.sub))
+        return cand[0]
+
+    if ref_spec.startswith("file="):
+        target = ref_spec.split("=", 1)[1]
+        target = os.path.normpath(target)
+        for r in runs:
+            if os.path.normpath(r.path) == target:
+                return r
+        raise ValueError(f"Reference file not found in loaded runs: {target}")
+
+    raise ValueError(f"Unknown --ref spec: {ref_spec}")
+
+
+# -------------------------
+# Metrics vs reference
+# -------------------------
+def compute_comparisons(runs: List[Run], ref: Run) -> List[Dict[str, Any]]:
+    """
+    Returns a list of dict rows for summary table and plotting.
+    """
+    rows: List[Dict[str, Any]] = []
+
+    # Reference signals
+    t_ref = ref.vol_t
+    v_ref = ref.vol_v
+
+    # Determine time interval for trajectory RMSE
+    t0 = 0.0
+    t1 = float(ref.T_target) if np.isfinite(ref.T_target) else (float(t_ref[-1]) if t_ref.size else np.nan)
+
+    # Reference volume normaliser
+    v_ref_final = ref.vol_final
+    if not np.isfinite(v_ref_final) and v_ref.size:
+        v_ref_final = float(v_ref[-1])
+    v_ref_final = float(v_ref_final) if np.isfinite(v_ref_final) else float("nan")
+
+    for r in runs:
+        # Final volume error
+        v_run_final = r.vol_final
+        if not np.isfinite(v_run_final) and r.vol_v.size:
+            v_run_final = float(r.vol_v[-1])
+
+        vol_abs_err = float("nan")
+        vol_rel_err = float("nan")
+        if np.isfinite(v_run_final) and np.isfinite(v_ref_final):
+            vol_abs_err = float(v_run_final - v_ref_final)
+            if abs(v_ref_final) > 1e-12:
+                vol_rel_err = float(vol_abs_err / v_ref_final)
+
+        # Trajectory RMSE
+        vol_traj_rmse = float("nan")
+        if r.vol_t.size >= 2 and r.vol_v.size >= 2 and t_ref.size >= 2 and v_ref.size >= 2:
+            t1_use = t1
+            if np.isfinite(t1_use):
+                t1_use = min(t1_use, float(r.T_target) if np.isfinite(r.T_target) else t1_use)
+                t1_use = min(t1_use, float(r.vol_t[-1]))
+                t1_use = min(t1_use, float(t_ref[-1]))
+            vol_traj_rmse = _interp_rmse(t_ref, v_ref, r.vol_t, r.vol_v, t0, t1_use, n=500)
+
+        # q_end RMS error
+        q_rms_err = float("nan")
+        if ref.q_end.size and r.q_end.size and ref.q_end.shape == r.q_end.shape:
+            diff = (r.q_end - ref.q_end).astype(np.float64, copy=False)
+            q_rms_err = float(np.sqrt(np.mean(diff * diff)))
+
+        # Cost metrics
+        sim_rate = float("nan")  # simulated seconds per real second
+        time_per_sim_s = float("nan")
+        if np.isfinite(r.t_forward_s) and np.isfinite(r.T_target) and r.t_forward_s > 0 and r.T_target > 0:
+            sim_rate = float(r.T_target / r.t_forward_s)
+            time_per_sim_s = float(r.t_forward_s / r.T_target)
+
+        rows.append(
+            dict(
+                path=r.path,
+                fps=r.fps,
+                sub=r.sub,
+                rep=r.rep,
+                seed=r.seed,
+                sim_dt=r.sim_dt,
+                frame_dt=r.frame_dt,
+                total_steps=r.total_steps,
+                T_target=r.T_target,
+                ok=int(bool(r.num_ok and r.phys_ok)),
+                num_ok=int(bool(r.num_ok)),
+                phys_ok=int(bool(r.phys_ok)),
+                t_forward_s=r.t_forward_s,
+                real_time_per_step_ms=r.real_time_per_step_ms,
+                time_per_sim_s=time_per_sim_s,
+                sim_rate=sim_rate,
+                max_speed=r.max_speed,
+                max_abs_pos=r.max_abs_pos,
+                vol_final=v_run_final,
+                vol_abs_err=vol_abs_err,
+                vol_rel_err=vol_rel_err,
+                vol_traj_rmse=vol_traj_rmse,
+                q_end_rms_err=q_rms_err,
+            )
+        )
+
+    rows.sort(key=lambda d: (d["sim_dt"], d["rep"], d["sub"]))
+    return rows
+
+
+# -------------------------
+# Plot helpers
+# -------------------------
+def plot_volume_trajectories(
+    runs: List[Run],
+    ref: Run,
+    out_dir: str,
+    subs_to_show: Optional[List[int]] = None,
+) -> None:
+    """
+    Overlay voxel volume trajectories for a few substeps (dt values) to show drift and shape changes.
+    """
+    all_subs = sorted({r.sub for r in runs if r.vol_t.size >= 2 and r.vol_v.size >= 2})
+    if not all_subs:
+        print("[WARN] No volume trajectories found to plot.")
+        return
+
+    if subs_to_show:
+        pick = [s for s in subs_to_show if s in all_subs]
+        if not pick:
+            pick = all_subs
+    else:
+        pick = all_subs
+
+    # For each sub, use the first rep found
+    chosen: List[Run] = []
+    for s in pick:
+        cand = [r for r in runs if r.sub == s and r.vol_t.size >= 2 and r.vol_v.size >= 2]
+        cand = sorted(cand, key=lambda r: (r.rep, r.sim_dt))
+        if cand:
+            chosen.append(cand[0])
+
+    # Ensure reference is included
+    if ref.sub not in [r.sub for r in chosen] and ref.vol_t.size >= 2:
+        chosen.append(ref)
+    chosen = sorted(chosen, key=lambda r: r.sim_dt)
+
+    plt.figure()
+    for r in chosen:
+        lab = f"sub={r.sub} (dt={r.sim_dt:.2e})"
+        if os.path.normpath(r.path) == os.path.normpath(ref.path):
+            lab += "  [ref]"
+        plt.plot(r.vol_t, r.vol_v, label=lab)
+
+    plt.xlabel("time [s]")
+    plt.ylabel("voxel volume")
+    plt.title("Voxel volume trajectory for different dt")
+    plt.legend(fontsize=9)
+    plt.grid(True, alpha=0.3)
+    _save_fig(out_dir, "volume_trajectory_overlay")
     plt.close()
 
 
-def plot_metric_vs_dt(df, group, metric, ylabel, filename, logy=False):
-    """
-    Per-rep scatter + mean±std errorbar vs dt.
-    """
-    if metric not in df.columns:
-        print(f"[WARN] Missing column: {metric}, skipping {filename}")
-        return
+def plot_errors_vs_dt(rows: List[Dict[str, Any]], ref: Run, out_dir: str) -> None:
+    dt = np.array([r["sim_dt"] for r in rows], dtype=float)
+    sub = np.array([r["sub"] for r in rows], dtype=int)
+    ok = np.array([r["ok"] for r in rows], dtype=int)
 
-    # scatter per run
-    plt.figure(figsize=(7.5, 5))
-    plt.scatter(df["dt_us"], df[metric], alpha=0.7)
+    vol_rel = np.array([r["vol_rel_err"] for r in rows], dtype=float)
+    vol_rmse = np.array([r["vol_traj_rmse"] for r in rows], dtype=float)
+    q_rms = np.array([r["q_end_rms_err"] for r in rows], dtype=float)
 
-    # mean ± std per setting
-    plt.errorbar(
-        group["dt_us"],
-        group[f"{metric}_mean"],
-        yerr=group[f"{metric}_std"],
-        marker="o",
-        linestyle="-",
-        capsize=3,
-    )
-
-    plt.xlabel("dt [µs]")
-    plt.ylabel(ylabel)
-    plt.title(f"{metric} vs dt (scatter=rep, line=mean±std)")
-    plt.grid(True, alpha=0.3)
-    if logy:
-        plt.yscale("log")
-    # dt is usually nicer on log-x when you add more points later
+    # final volume rel error vs dt
+    plt.figure()
+    plt.scatter(dt, np.abs(vol_rel), c=ok)
+    for i in range(len(rows)):
+        y = abs(vol_rel[i]) if np.isfinite(vol_rel[i]) else 1e-16
+        plt.annotate(f"{sub[i]}", (dt[i], max(1e-16, y)), fontsize=8)
     plt.xscale("log")
+    plt.yscale("log")
+    plt.xlabel("dt [s] (log)")
+    plt.ylabel("|final volume relative error| vs reference (log)")
+    plt.title(f"Final volume error vs dt (reference: sub={ref.sub}, dt={ref.sim_dt:.2e})")
+    plt.grid(True, which="both", alpha=0.3)
+    _save_fig(out_dir, "error_final_volume_rel_vs_dt")
+    plt.close()
 
-    savefig(os.path.join(OUT_DIR, filename))
-
-
-def plot_two_metrics_vs_dt(group, m1, m2, y1, y2, filename, logy=False):
-    if (m1 not in group.columns) or (m2 not in group.columns):
-        print(f"[WARN] Missing grouped cols for {m1}/{m2}, skipping {filename}")
-        return
-
-    plt.figure(figsize=(7.5, 5))
-    plt.plot(group["dt_us"], group[m1], marker="o", linestyle="-", label=y1)
-    plt.plot(group["dt_us"], group[m2], marker="o", linestyle="-", label=y2)
-    plt.xlabel("dt [µs]")
-    plt.title(f"{y1} and {y2} vs dt")
-    plt.grid(True, alpha=0.3)
+    # trajectory RMSE vs dt
+    plt.figure()
+    plt.scatter(dt, vol_rmse, c=ok)
+    for i in range(len(rows)):
+        if np.isfinite(vol_rmse[i]):
+            plt.annotate(f"{sub[i]}", (dt[i], vol_rmse[i]), fontsize=8)
     plt.xscale("log")
-    if logy:
+    plt.yscale("log")
+    plt.xlabel("dt [s] (log)")
+    plt.ylabel("volume trajectory RMSE vs reference (log)")
+    plt.title("Volume trajectory difference vs dt")
+    plt.grid(True, which="both", alpha=0.3)
+    _save_fig(out_dir, "error_volume_traj_rmse_vs_dt")
+    plt.close()
+
+    # q_end rms error vs dt
+    if np.isfinite(q_rms).any():
+        plt.figure()
+        plt.scatter(dt, q_rms, c=ok)
+        for i in range(len(rows)):
+            if np.isfinite(q_rms[i]):
+                plt.annotate(f"{sub[i]}", (dt[i], q_rms[i]), fontsize=8)
+        plt.xscale("log")
         plt.yscale("log")
+        plt.xlabel("dt [s] (log)")
+        plt.ylabel("q_end RMS error vs reference (log)")
+        plt.title("Final cloth state difference vs dt")
+        plt.grid(True, which="both", alpha=0.3)
+        _save_fig(out_dir, "error_qend_rms_vs_dt")
+        plt.close()
+
+
+def plot_cost_vs_dt(rows: List[Dict[str, Any]], out_dir: str) -> None:
+    dt = np.array([r["sim_dt"] for r in rows], dtype=float)
+    sub = np.array([r["sub"] for r in rows], dtype=int)
+
+    t_forward = np.array([r["t_forward_s"] for r in rows], dtype=float)
+    time_per_sim_s = np.array([r["time_per_sim_s"] for r in rows], dtype=float)
+
+    plt.figure()
+    plt.scatter(dt, t_forward)
+    for i in range(len(rows)):
+        if np.isfinite(t_forward[i]):
+            plt.annotate(f"{sub[i]}", (dt[i], t_forward[i]), fontsize=8)
+    plt.xscale("log")
+    plt.xlabel("dt [s] (log)")
+    plt.ylabel("forward runtime [s]")
+    plt.title("Forward runtime vs dt")
+    plt.grid(True, which="both", alpha=0.3)
+    _save_fig(out_dir, "cost_forward_runtime_vs_dt")
+    plt.close()
+
+    if np.isfinite(time_per_sim_s).any():
+        plt.figure()
+        plt.scatter(dt, time_per_sim_s)
+        for i in range(len(rows)):
+            if np.isfinite(time_per_sim_s[i]):
+                plt.annotate(f"{sub[i]}", (dt[i], time_per_sim_s[i]), fontsize=8)
+        plt.xscale("log")
+        plt.yscale("log")
+        plt.xlabel("dt [s] (log)")
+        plt.ylabel("real seconds per simulated second (log)")
+        plt.title("How expensive is one simulated second")
+        plt.grid(True, which="both", alpha=0.3)
+        _save_fig(out_dir, "cost_time_per_sim_second_vs_dt")
+        plt.close()
+
+
+def plot_tradeoff(rows: List[Dict[str, Any]], ref: Run, out_dir: str) -> None:
+    """
+    Accuracy vs compute, with each point labelled by substeps.
+    """
+    sub = np.array([r["sub"] for r in rows], dtype=int)
+    ok = np.array([r["ok"] for r in rows], dtype=int)
+
+    cost = np.array([r["t_forward_s"] for r in rows], dtype=float)
+
+    vol_rmse = np.array([r["vol_traj_rmse"] for r in rows], dtype=float)
+    q_rms = np.array([r["q_end_rms_err"] for r in rows], dtype=float)
+
+    use_q = np.isfinite(q_rms).any()
+    if use_q:
+        vr = vol_rmse.copy()
+        qr = q_rms.copy()
+        vr = vr / (np.nanmedian(vr[np.isfinite(vr)]) + 1e-12)
+        qr = qr / (np.nanmedian(qr[np.isfinite(qr)]) + 1e-12)
+        err = np.sqrt(vr * vr + qr * qr)
+    else:
+        err = np.abs(vol_rmse)
+
+    plt.figure()
+    plt.scatter(cost, err, c=ok)
+    for i in range(len(rows)):
+        if np.isfinite(cost[i]) and np.isfinite(err[i]):
+            plt.annotate(f"{sub[i]}", (cost[i], err[i]), fontsize=8)
+    plt.yscale("log")
+    plt.xlabel("forward runtime [s]")
+    plt.ylabel("combined error vs reference (log)")
+    plt.title(f"Speed accuracy tradeoff (reference sub={ref.sub})")
+    plt.grid(True, which="both", alpha=0.3)
+    _save_fig(out_dir, "tradeoff_speed_accuracy")
+    plt.close()
+
+    finite = np.isfinite(cost) & np.isfinite(err)
+    if np.any(finite):
+        c = cost[finite]
+        e = err[finite]
+        s = sub[finite]
+
+        c_n = (c - np.min(c)) / (np.max(c) - np.min(c) + 1e-12)
+        e_n = (e - np.min(e)) / (np.max(e) - np.min(e) + 1e-12)
+        score = np.sqrt(c_n * c_n + e_n * e_n)
+        j = int(np.argmin(score))
+        print(f"[suggestion] knee candidate: sub={int(s[j])}  runtime={c[j]:.3g}s  err={e[j]:.3g}")
+
+
+def plot_stability(rows: List[Dict[str, Any]], out_dir: str) -> None:
+    dt = np.array([r["sim_dt"] for r in rows], dtype=float)
+    sub = np.array([r["sub"] for r in rows], dtype=int)
+    ok = np.array([r["ok"] for r in rows], dtype=int)
+    num_ok = np.array([r["num_ok"] for r in rows], dtype=int)
+    phys_ok = np.array([r["phys_ok"] for r in rows], dtype=int)
+
+    plt.figure()
+    plt.scatter(dt, num_ok, label="num_ok")
+    plt.scatter(dt, phys_ok, label="phys_ok")
+    plt.scatter(dt, ok, label="both ok")
+    for i in range(len(rows)):
+        plt.annotate(f"{sub[i]}", (dt[i], ok[i]), fontsize=8)
+    plt.xscale("log")
+    plt.yticks([0, 1], ["fail", "ok"])
+    plt.xlabel("dt [s] (log)")
+    plt.ylabel("sanity checks")
+    plt.title("Stability and sanity checks vs dt")
     plt.legend()
-    savefig(os.path.join(OUT_DIR, filename))
+    plt.grid(True, which="both", alpha=0.3)
+    _save_fig(out_dir, "stability_checks_vs_dt")
+    plt.close()
 
 
-def main():
-    df = pd.read_csv(CSV_PATH)
+def plot_max_speed_vs_dt(rows: List[Dict[str, Any]], out_dir: str) -> None:
+    dt = np.array([r["sim_dt"] for r in rows], dtype=float)
+    sub = np.array([r["sub"] for r in rows], dtype=int)
+    max_speed = np.array([r["max_speed"] for r in rows], dtype=float)
 
-    # numeric columns (robust to blanks)
-    num_cols = [
-        "fps", "sim_substeps", "rep",
-        "dt", "num_frames", "total_steps",
-        "t_pose_s", "t_forceopt_s", "t_forward_s", "real_time_per_step_ms",
-        "num_ok", "phys_ok", "diff_norm", "max_abs_pos", "max_speed",
-        "forceopt_loss0", "forceopt_lossT", "forces_mean", "forces_max",
-        "vol_final", "vol_final_ref", "vol_abs_err", "vol_rel_err",
-        "vol_traj_rmse", "q_final_rms_err",
+    if not np.isfinite(max_speed).any():
+        return
+
+    plt.figure()
+    plt.scatter(dt, max_speed)
+    for i in range(len(rows)):
+        if np.isfinite(max_speed[i]):
+            plt.annotate(f"{sub[i]}", (dt[i], max_speed[i]), fontsize=8)
+    plt.xscale("log")
+    plt.yscale("log")
+    plt.xlabel("dt [s] (log)")
+    plt.ylabel("max particle speed (log)")
+    plt.title("Max speed vs dt (often reveals instability onset)")
+    plt.grid(True, which="both", alpha=0.3)
+    _save_fig(out_dir, "max_speed_vs_dt")
+    plt.close()
+
+
+def write_summary_csv(rows: List[Dict[str, Any]], out_dir: str) -> None:
+    import csv
+
+    path = os.path.join(out_dir, "summary_table.csv")
+    cols = [
+        "rep",
+        "sub",
+        "sim_dt",
+        "t_forward_s",
+        "time_per_sim_s",
+        "total_steps",
+        "ok",
+        "num_ok",
+        "phys_ok",
+        "vol_final",
+        "vol_abs_err",
+        "vol_rel_err",
+        "vol_traj_rmse",
+        "q_end_rms_err",
+        "max_speed",
+        "max_abs_pos",
+        "path",
     ]
-    to_num(df, num_cols)
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(cols)
+        for r in rows:
+            w.writerow([r.get(c, "") for c in cols])
+    print(f"[saved] {path}")
 
-    # derived
-    df["dt_us"] = df["dt"] * 1e6
-    df["dt_ns"] = df["dt"] * 1e9
 
-    # guard: only keep rows with dt present
-    df = df[np.isfinite(df["dt"])].copy()
+# -------------------------
+# Main
+# -------------------------
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data_dir", default="dt_sweep_data", help="directory containing run_*.npz")
+    ap.add_argument("--out_dir", default="dt_sweep_plots", help="directory to save plots")
+    ap.add_argument("--ref", default="min_dt", help="reference selection: min_dt | sub=50 | rep=1 | file=PATH")
+    ap.add_argument("--show", action="store_true", help="also show figures interactively")
+    ap.add_argument(
+        "--traj_subs",
+        default="",
+        help="comma separated substeps to overlay in trajectory plot, eg: 5,20,100 (empty = auto)",
+    )
+    args = ap.parse_args()
 
-    # group: one row per (fps, sim_substeps)
-    keys = ["fps", "sim_substeps"]
-    agg = {
-        "dt": "first",
-        "dt_us": "first",
-        "dt_ns": "first",
-        "num_frames": "first",
-        "total_steps": "first",
-        "num_ok": "mean",
-        "phys_ok": "mean",
-        "diff_norm": ["mean", "std"],
-        "t_forward_s": ["mean", "std"],
-        "t_forceopt_s": ["mean", "std"],
-        "vol_final": ["mean", "std"],
-        "vol_final_ref": "first",
-        "vol_rel_err": ["mean", "std"],
-        "vol_abs_err": ["mean", "std"],
-        "vol_traj_rmse": ["mean", "std"],
-        "q_final_rms_err": ["mean", "std"],
-        "forces_mean": ["mean", "std"],
-        "forces_max": ["mean", "std"],
-        "forceopt_lossT": ["mean", "std"],
-    }
+    data_dir = os.path.abspath(args.data_dir)
+    out_dir = os.path.abspath(args.out_dir)
+    _ensure_dir(out_dir)
 
-    group = df.groupby(keys, as_index=False).agg(agg)
+    runs = load_runs(data_dir)
+    ref = pick_reference(runs, args.ref)
+    rows = compute_comparisons(runs, ref)
 
-    # flatten columns
-    group.columns = [
-        "_".join([c for c in col if c]) if isinstance(col, tuple) else col
-        for col in group.columns
-    ]
-    # rename a few common ones
-    rename = {
-        "dt_us_first": "dt_us",
-        "dt_first": "dt",
-        "dt_ns_first": "dt_ns",
-        "num_frames_first": "num_frames",
-        "total_steps_first": "total_steps",
-        "vol_final_ref_first": "vol_final_ref",
-        "num_ok_mean": "num_ok_rate",
-        "phys_ok_mean": "phys_ok_rate",
-    }
-    group = group.rename(columns=rename)
+    print(f"[info] loaded runs: {len(runs)}")
+    print(f"[info] reference: sub={ref.sub} dt={ref.sim_dt:.2e} rep={ref.rep} file={os.path.basename(ref.path)}")
 
-    # fill std NaN (happens if only one rep)
-    for c in group.columns:
-        if c.endswith("_std"):
-            group[c] = group[c].fillna(0.0)
+    write_summary_csv(rows, out_dir)
 
-    # sort by dt
-    group = group.sort_values("dt")
+    subs_to_show = None
+    if args.traj_subs.strip():
+        subs_to_show = [int(s.strip()) for s in args.traj_subs.split(",") if s.strip()]
 
-    # save summary table
-    summary_path = os.path.join(OUT_DIR, "summary_grouped.csv")
-    group.to_csv(summary_path, index=False)
-    print(f"[OK] Wrote grouped summary to {summary_path}")
+    plot_volume_trajectories(runs, ref, out_dir, subs_to_show=subs_to_show)
+    plot_errors_vs_dt(rows, ref, out_dir)
+    plot_cost_vs_dt(rows, out_dir)
+    plot_tradeoff(rows, ref, out_dir)
+    plot_stability(rows, out_dir)
+    plot_max_speed_vs_dt(rows, out_dir)
 
-    # quick console summary
-    print("\nGrouped summary (mean ± std):")
-    for _, r in group.iterrows():
-        fps = int(r["fps"])
-        sub = int(r["sim_substeps"])
-        print(
-            f"  fps={fps} sub={sub} dt={r['dt']:.2e}  "
-            f"vol_rel_err={r['vol_rel_err_mean']:.3e}±{r['vol_rel_err_std']:.1e}  "
-            f"traj_rmse={r['vol_traj_rmse_mean']:.3e}±{r['vol_traj_rmse_std']:.1e}  "
-            f"q_rms={r['q_final_rms_err_mean']:.3e}±{r['q_final_rms_err_std']:.1e}  "
-            f"forces_max={r['forces_max_mean']:.2f}±{r['forces_max_std']:.2f}"
-        )
+    print(f"[done] plots saved to: {out_dir}")
+    print(f"[done] presentation plots saved alongside originals with *_presentation.png")
 
-    # Timing sanity warning: if per-step time decreases a lot when steps increase,
-    # you probably measured async kernel launch time, not true GPU time.
-    if "t_forward_s_mean" in group.columns:
-        if len(group) >= 2:
-            steps = group["total_steps"].to_numpy(dtype=float)
-            tmean = group["t_forward_s_mean"].to_numpy(dtype=float)
-            ms_per_step = 1e3 * (tmean / np.maximum(steps, 1.0))
-            ratio = np.max(ms_per_step) / max(np.min(ms_per_step), 1e-12)
-            if ratio > 3.0:
-                print(
-                    "\n[WARN] Forward timing looks unsynchronized (ms/step varies a lot across dt). "
-                    "For real timing, add wp.synchronize() right after tendon.forward()."
-                )
-
-    # --- Plots you likely care about most ---
-    plot_metric_vs_dt(df, group, "vol_rel_err", "Volume rel. error vs reference [-]",
-                      "01_vol_rel_err_vs_dt.png", logy=True)
-
-    plot_metric_vs_dt(df, group, "vol_traj_rmse", "Volume trajectory RMSE [vox units]",
-                      "02_vol_traj_rmse_vs_dt.png", logy=True)
-
-    plot_metric_vs_dt(df, group, "q_final_rms_err", "Final particle position RMS error [m]",
-                      "03_q_final_rms_err_vs_dt.png", logy=True)
-
-    # absolute volume final (with reference line)
-    if "vol_final" in df.columns and "vol_final_ref" in df.columns:
-        plt.figure(figsize=(7.5, 5))
-        plt.scatter(df["dt_us"], df["vol_final"], alpha=0.7, label="rep")
-        plt.errorbar(
-            group["dt_us"],
-            group["vol_final_mean"],
-            yerr=group["vol_final_std"],
-            marker="o",
-            linestyle="-",
-            capsize=3,
-            label="mean±std",
-        )
-        # reference line (first non-nan ref)
-        ref = group["vol_final_ref"].dropna()
-        if len(ref) > 0:
-            plt.axhline(float(ref.iloc[0]), linestyle="--", linewidth=1.5, label="reference vol_final")
-        plt.xlabel("dt [µs]")
-        plt.ylabel("vol_final")
-        plt.title("Final enclosed volume vs dt")
-        plt.grid(True, alpha=0.3)
-        plt.xscale("log")
-        plt.legend()
-        savefig(os.path.join(OUT_DIR, "04_vol_final_vs_dt.png"))
-
-    # force behaviour vs dt (this will highlight saturation)
-    if "forces_max_mean" in group.columns and "forces_mean_mean" in group.columns:
-        plt.figure(figsize=(7.5, 5))
-        plt.plot(group["dt_us"], group["forces_mean_mean"], marker="o", linestyle="-", label="forces_mean")
-        plt.plot(group["dt_us"], group["forces_max_mean"], marker="o", linestyle="-", label="forces_max")
-        plt.xlabel("dt [µs]")
-        plt.ylabel("Force [N]")
-        plt.title("Force optimisation outcome vs dt")
-        plt.grid(True, alpha=0.3)
-        plt.xscale("log")
-        plt.legend()
-        savefig(os.path.join(OUT_DIR, "05_forces_vs_dt.png"))
-
-    # time vs dt (measured)
-    if "t_forward_s_mean" in group.columns and "t_forceopt_s_mean" in group.columns:
-        plt.figure(figsize=(7.5, 5))
-        plt.plot(group["dt_us"], group["t_forward_s_mean"], marker="o", linestyle="-", label="t_forward_s (measured)")
-        plt.plot(group["dt_us"], group["t_forceopt_s_mean"], marker="o", linestyle="-", label="t_forceopt_s (measured)")
-        plt.xlabel("dt [µs]")
-        plt.ylabel("Time [s]")
-        plt.title("Measured runtime vs dt (may be async if not synchronized)")
-        plt.grid(True, alpha=0.3)
-        plt.xscale("log")
-        plt.legend()
-        savefig(os.path.join(OUT_DIR, "06_time_vs_dt.png"))
-
-    # Pareto-ish: error vs runtime
-    if "t_forward_s_mean" in group.columns and "vol_traj_rmse_mean" in group.columns:
-        plt.figure(figsize=(7.5, 5))
-        plt.scatter(group["t_forward_s_mean"], group["vol_traj_rmse_mean"])
-        for _, r in group.iterrows():
-            plt.annotate(
-                f"sub={int(r['sim_substeps'])}",
-                (r["t_forward_s_mean"], r["vol_traj_rmse_mean"]),
-                textcoords="offset points",
-                xytext=(4, 4),
-                fontsize=8,
-            )
-        plt.xlabel("t_forward_s mean [s] (measured)")
-        plt.ylabel("vol_traj_rmse mean")
-        plt.title("Pareto: volume traj error vs forward runtime")
-        plt.grid(True, alpha=0.3)
-        savefig(os.path.join(OUT_DIR, "07_pareto_rmse_vs_forward_time.png"))
-
-    # Simple heatmap (fps x sim_substeps) for vol_rel_err_mean
-    if "vol_rel_err_mean" in group.columns:
-        piv = group.pivot(index="fps", columns="sim_substeps", values="vol_rel_err_mean")
-        plt.figure(figsize=(7.5, 2.5 + 0.6 * len(piv.index)))
-        plt.imshow(piv.values, aspect="auto", interpolation="nearest")
-        plt.colorbar(label="vol_rel_err_mean")
-        plt.xticks(range(len(piv.columns)), [str(c) for c in piv.columns])
-        plt.yticks(range(len(piv.index)), [str(i) for i in piv.index])
-        plt.xlabel("sim_substeps")
-        plt.ylabel("fps")
-        plt.title("Heatmap: mean volume relative error")
-        savefig(os.path.join(OUT_DIR, "08_heatmap_vol_rel_err.png"))
-
-    print(f"\n[OK] Plots saved to: {OUT_DIR}")
+    if args.show:
+        print("[note] This script saves plots and closes figures. For interactive viewing, open the PNG files.")
 
 
 if __name__ == "__main__":
