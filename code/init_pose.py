@@ -1,3 +1,5 @@
+# init_pose.py
+
 import os
 import numpy as np
 import torch
@@ -269,6 +271,8 @@ class InitializeFingers:
         self.cloth_k = int(cloth_k)
         self.cloth_alphas = tuple(float(a) for a in cloth_alphas)
         self.cloth_margin_mult = float(cloth_margin_mult)
+
+        self.object_rot = object_rot # for proxy volume
         
         self.integrator = wp.sim.SemiImplicitIntegrator()
         self.build_rigid_model(object_rot)
@@ -278,12 +282,16 @@ class InitializeFingers:
         # for arbitrary number of points (e.g. one value per finger)
         self.transform_2d_wp = wp.zeros(self.finger_num, dtype=wp.float32, requires_grad=True)
 
-        self.log = False
+        self.log = True
         # --- History Storage ---
         self.loss_history = []
         self.radius_history = []
         self.iter_history = []
 
+        # NEW: store loss decomposition
+        self.finger_loss_history = []
+        self.cloth_loss_raw_history = []
+        self.cloth_loss_norm_history = []
 
         wp.launch(utils.transform_to11d, dim=1,
                   inputs=[self.joint_q],
@@ -528,6 +536,175 @@ class InitializeFingers:
 
         self.proxy_pts_frozen = np.vstack(pts).astype(np.float32)  # (M,3)
         return self.proxy_pts_frozen
+    
+
+
+    def _proxy_points_world_np(self):
+        """
+        Returns proxy surface sample points in world coords as (M,3) float32.
+        Uses current curr_finger_mesh and cloth edge ids.
+        """
+        if (not self.consider_cloth) or (len(self.cloth_pairs) == 0):
+            return None
+
+        # Ensure curr_finger_mesh is up to date for current params
+        # This is cheap and avoids stale points if called after optimisation
+        with torch.no_grad():
+            _ = self.forward(distance_param=0.0, use_com=True)
+
+        pts = []
+        for (a, b) in self.cloth_pairs:
+            ids_a = self.cloth_left_ids[a].numpy().astype(np.int32)
+            ids_b = self.cloth_right_ids[b].numpy().astype(np.int32)
+
+            Pa = self.curr_finger_mesh[a].numpy()[ids_a]  # (k,3)
+            Pb = self.curr_finger_mesh[b].numpy()[ids_b]  # (k,3)
+
+            for alpha in self.cloth_alphas:
+                pts.append((1.0 - float(alpha)) * Pa + float(alpha) * Pb)
+
+        pts = np.vstack(pts).astype(np.float32)
+        return pts
+
+
+    def _print_rigid_proxy_volume_debug(self, finger_transform_for_ref_vox=None):
+        """
+        Prints a few cheap rigid proxy volume estimates.
+        Optionally also prints a voxel reference computed from a freshly built FEM model
+        using finger_transform_for_ref_vox (the same transforms you return to forward.py).
+        """
+        pts = self._proxy_points_world_np()
+        if pts is None or pts.shape[0] < 10:
+            print(f"[InitPoseVol] obj={self.ycb_object_name} fingers={self.finger_num} no proxy points, skip volume")
+            return
+
+        # Height from proxy points
+        y0 = float(pts[:, 1].min())
+        y1 = float(pts[:, 1].max())
+        h = max(1e-9, y1 - y0)
+
+        # 3D convex hull volume and 2D hull area (xz)
+        vol_hull_3d = None
+        area_xz = None
+
+        try:
+            from scipy.spatial import ConvexHull
+
+            # 3D hull
+            if pts.shape[0] >= 4:
+                vol_hull_3d = float(ConvexHull(pts).volume)
+
+            # 2D hull on xz (ConvexHull "volume" is area in 2D)
+            xz = pts[:, [0, 2]]
+            if xz.shape[0] >= 3:
+                area_xz = float(ConvexHull(xz).volume)
+
+        except Exception as e:
+            print(f"[InitPoseVol] scipy ConvexHull failed: {e}")
+
+        vol_prism_xz = None
+        vol_cyl_eq = None
+        r_eq = None
+        if area_xz is not None:
+            vol_prism_xz = area_xz * h
+            r_eq = math.sqrt(max(area_xz, 0.0) / math.pi)
+            vol_cyl_eq = math.pi * r_eq * r_eq * h
+
+        print(
+            f"[InitPoseVol] obj={self.ycb_object_name} fingers={self.finger_num} "
+            f"y_range=[{y0:.6g},{y1:.6g}] h={h:.6g}"
+        )
+        print(
+            f"[InitPoseVol] proxy_hull_3d={vol_hull_3d if vol_hull_3d is not None else 'None'} "
+            f"proxy_area_xz={area_xz if area_xz is not None else 'None'} "
+            f"proxy_prism_xz={vol_prism_xz if vol_prism_xz is not None else 'None'} "
+            f"proxy_cyl_eq={vol_cyl_eq if vol_cyl_eq is not None else 'None'} "
+            f"(r_eq={r_eq if r_eq is not None else 'None'})"
+        )
+
+        # Optional: voxel reference volume from a freshly built FEM model
+        if finger_transform_for_ref_vox is None:
+            return
+
+        try:
+            from enclosed_volume_voxel import (
+                VoxelFillConfig,
+                VoxelVolumeEstimator,
+                prepare_vox_topology_from_model,
+            )
+            from tendon_model import TendonModelBuilder
+            from object_loader import ObjectLoader
+
+            obj_loader = ObjectLoader()
+            b = TendonModelBuilder()
+
+            # Build exactly like forward.py does
+            utils.load_object(
+                b, obj_loader,
+                object=self.obj_name,
+                ycb_object_name=self.ycb_object_name,
+                obj_rot=self.object_rot,
+                scale=self.scale,
+                use_simple_mesh=False,
+                is_fix=True,
+                density=1e1,
+            )
+
+            b.init_builder_tendon_variables(self.finger_num, self.finger_len, self.scale, requires_grad=False)
+
+            # Signature may differ across your branches, so keep a safe call pattern
+            try:
+                b.build_fem_model(
+                    finger_width=self.finger_width,
+                    finger_rot=self.finger_rot,
+                    obj_loader=obj_loader,
+                    finger_transform=finger_transform_for_ref_vox,
+                    is_triangle=True,
+                    add_connecting_cloth=True,
+                    add_drop_cloth=False,
+                )
+            except TypeError:
+                b.build_fem_model(
+                    finger_width=self.finger_width,
+                    finger_rot=self.finger_rot,
+                    obj_loader=obj_loader,
+                    finger_transform=finger_transform_for_ref_vox,
+                    is_triangle=True,
+                )
+
+            model = b.model
+            s0 = model.state()
+            q0 = s0.particle_q.numpy()
+            if q0.ndim == 3:
+                q0 = q0[0]
+
+            cloth_tris, solid_tris, rim_ids = prepare_vox_topology_from_model(model)
+            cfg = VoxelFillConfig(
+                voxel_size=0.002 * float(self.scale),
+                pad_vox=3,
+                cloth_thickness_vox=1,
+                solid_thickness_vox=1,
+                lid_thickness_vox=1,
+                sample_step_factor=0.5,
+            )
+            vox = VoxelVolumeEstimator(
+                cloth_tri_indices=cloth_tris,
+                solid_tri_indices=solid_tris,
+                rim_ids=rim_ids,
+                cfg=cfg,
+            )
+            vox.set_open_rims(q0)
+
+            vol0, dbg0 = vox.compute(q0, return_points=False)
+            vol0 = float(vol0)
+
+            print(
+                f"[InitPoseVol] vox_reference_t0={vol0:.6g} "
+                f"shape={dbg0.get('shape', None)} enclosed_vox={dbg0.get('enclosed_voxels', None)}"
+            )
+        except Exception as e:
+            print(f"[InitPoseVol] voxel reference failed: {e}")
+
 
 
     def sweep_R0(self, distance_param=1e-1, use_com=True):
@@ -786,15 +963,18 @@ class InitializeFingers:
     def compute_loss(self, total_dis_torch):
 
         finger_loss = total_dis_torch[0]
-        cloth_loss  = total_dis_torch[1]
+        cloth_loss_raw = total_dis_torch[1]
 
+        cloth_loss_norm = cloth_loss_raw
         if self.consider_cloth and len(self.cloth_pairs) > 0:
-            cloth_loss = cloth_loss / (len(self.cloth_pairs) * len(self.cloth_alphas) * self.cloth_k)
-        # store for logging
-        self.finger_loss = finger_loss.detach()
-        self.cloth_loss  = cloth_loss.detach()
+            cloth_loss_norm = cloth_loss_raw / (len(self.cloth_pairs) * len(self.cloth_alphas) * self.cloth_k)
 
-        self.loss = finger_loss + cloth_loss
+        # store for logging (detach so histories don’t keep the graph)
+        self.finger_loss = finger_loss.detach()
+        self.cloth_loss_raw = cloth_loss_raw.detach()
+        self.cloth_loss = cloth_loss_norm.detach()   # keep name for existing prints
+
+        self.loss = finger_loss + cloth_loss_norm
 
 
     def step(self, iter, distance_param=1.0, use_com=False):
@@ -821,8 +1001,13 @@ class InitializeFingers:
             self.radius_history.append(current_radius)
             self.iter_history.append(iter)
 
+            # NEW: loss breakdown history
+            self.finger_loss_history.append(float(self.finger_loss.item()))
+            self.cloth_loss_raw_history.append(float(self.cloth_loss_raw.item()))
+            self.cloth_loss_norm_history.append(float(self.cloth_loss.item()))
+
             # log to console
-            if self.verbose and iter % 10 == 0 or iter % 100 == 0:
+            if self.verbose and iter % 100 == 0 or iter % 100 == 0:
                 r = current_radius
                 lr9  = self.optimizer.param_groups[0]["lr"]
                 lr2  = self.optimizer.param_groups[1]["lr"]
@@ -838,59 +1023,138 @@ class InitializeFingers:
         self.optimizer.zero_grad()
     
     def export_and_plot(self, output_dir="opt_results", threshold=None):
-        """Saves optimization history to CSV and plots graphs."""
+        """Saves optimization history to CSV and plots graphs (old + new, separate)."""
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
-        
-        # 1. Save to CSV
-        csv_filename = os.path.join(output_dir, f"log_{self.ycb_object_name}_pose{self.pose_id}.csv")
+
+        tag = f"{self.ycb_object_name}_pose{self.pose_id}"
+
+        # ----------------
+        # 1) Save CSV
+        # ----------------
+        csv_filename = os.path.join(output_dir, f"log_{tag}.csv")
         print(f"Saving CSV to {csv_filename}...")
-        
-        with open(csv_filename, mode='w', newline='') as file:
+
+        with open(csv_filename, mode="w", newline="") as file:
             writer = csv.writer(file)
-            # Header: Iteration, Loss, Finger_0, Finger_1, ...
-            headers = ["Iteration", "Loss"] + [f"Finger_{i}_Radius" for i in range(self.finger_num)]
+            headers = (
+                ["Iteration", "Loss", "FingerLoss", "ClothLossRaw", "ClothLossNorm"]
+                + [f"Finger_{i}_Radius" for i in range(self.finger_num)]
+            )
             writer.writerow(headers)
-            
-            for i in range(len(self.iter_history)):
-                row = [self.iter_history[i], self.loss_history[i]]
-                row.extend(self.radius_history[i]) # Add all finger radii
+
+            n = len(self.iter_history)
+            for i in range(n):
+                row = [
+                    self.iter_history[i],
+                    self.loss_history[i],
+                    self.finger_loss_history[i] if i < len(self.finger_loss_history) else "",
+                    self.cloth_loss_raw_history[i] if i < len(self.cloth_loss_raw_history) else "",
+                    self.cloth_loss_norm_history[i] if i < len(self.cloth_loss_norm_history) else "",
+                ]
+                row.extend(self.radius_history[i])
                 writer.writerow(row)
 
-        # 2. Plot Loss vs Iteration
-        plt.figure(figsize=(10, 5))
-        plt.plot(self.iter_history, self.loss_history, label='Loss', color='red', linewidth=1.5)
+        # Small helper for consistent plotting
+        def _plot_1d(x, y, title, ylabel, filename, logy=True):
+            if y is None or len(y) == 0:
+                return
+            plt.figure(figsize=(10, 5))
+            plt.plot(x, y, linewidth=1.5)
+            if threshold is not None and False:
+                plt.axhline(y=threshold, linestyle="--", label=f"threshold={threshold}")
+            if logy:
+                plt.yscale("log")
+            plt.xlabel("Iterations")
+            plt.ylabel(ylabel + (" (Log Scale)" if logy else ""))
+            plt.title(title)
+            plt.grid(True, which="both" if logy else "major", ls="-", alpha=0.2)
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, filename), dpi=150)
+            plt.close()
 
-        # --- NEW: Add Threshold Line ---
-        if threshold is not None and False:
-            plt.axhline(y=threshold, color='green', linestyle='--', label=f'Convergence Threshold ({threshold})')
-        # Use Log Scale so we can actually see 1e-5
-        plt.yscale('log')
-        plt.xlabel('Iterations')
-        plt.ylabel('Loss (Log Scale)')
-        plt.title(f'Optimization Loss - {self.ycb_object_name}')
-        plt.grid(True, which="both", ls="-", alpha=0.2) # finer grid for log scale
+        x = self.iter_history
+
+        # ----------------
+        # 2) OLD plot: total loss only (same as before, but pose-safe name)
+        # ----------------
+        _plot_1d(
+            x, self.loss_history,
+            title=f"Optimization Loss (Total) - {tag}",
+            ylabel="Loss",
+            filename=f"plot_loss_total_{tag}.png",
+            logy=True,
+        )
+
+        # ----------------
+        # 3) NEW plots: separate components
+        # ----------------
+        if len(self.finger_loss_history) == len(x):
+            _plot_1d(
+                x, self.finger_loss_history,
+                title=f"Loss Component (Finger) - {tag}",
+                ylabel="Finger loss",
+                filename=f"plot_loss_finger_{tag}.png",
+                logy=True,
+            )
+
+        if len(self.cloth_loss_norm_history) == len(x):
+            _plot_1d(
+                x, self.cloth_loss_norm_history,
+                title=f"Loss Component (Cloth, normalised) - {tag}",
+                ylabel="Cloth loss (norm)",
+                filename=f"plot_loss_cloth_norm_{tag}.png",
+                logy=True,
+            )
+
+        if len(self.cloth_loss_raw_history) == len(x):
+            _plot_1d(
+                x, self.cloth_loss_raw_history,
+                title=f"Loss Component (Cloth, raw) - {tag}",
+                ylabel="Cloth loss (raw)",
+                filename=f"plot_loss_cloth_raw_{tag}.png",
+                logy=True,
+            )
+
+        # ----------------
+        # 4) Optional: keep your combined breakdown plot too
+        # ----------------
+        plt.figure(figsize=(10, 5))
+        plt.plot(x, self.loss_history, label="Total", linewidth=1.5)
+        if len(self.finger_loss_history) == len(x):
+            plt.plot(x, self.finger_loss_history, label="Finger", linewidth=1.2)
+        if len(self.cloth_loss_norm_history) == len(x):
+            plt.plot(x, self.cloth_loss_norm_history, label="Cloth (norm)", linewidth=1.2)
+        if len(self.cloth_loss_raw_history) == len(x):
+            plt.plot(x, self.cloth_loss_raw_history, label="Cloth (raw)", linewidth=1.0, alpha=0.7)
+        plt.yscale("log")
+        plt.xlabel("Iterations")
+        plt.ylabel("Loss (Log Scale)")
+        plt.title(f"Loss Breakdown - {tag}")
+        plt.grid(True, which="both", ls="-", alpha=0.2)
         plt.legend()
-        plt.savefig(os.path.join(output_dir, f"plot_loss_{self.ycb_object_name}.png"))
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f"plot_loss_breakdown_{tag}.png"), dpi=150)
         plt.close()
 
-        # 3. Plot Radius vs Iteration
+        # ----------------
+        # 5) OLD plot: radius trajectories (pose-safe name)
+        # ----------------
+        radii_array = np.array(self.radius_history)
         plt.figure(figsize=(10, 5))
-        # Convert list of arrays to a 2D array for easier plotting [iters, fingers]
-        radii_array = np.array(self.radius_history) 
-        
         for i in range(self.finger_num):
-            plt.plot(self.iter_history, radii_array[:, i], label=f'Finger {i}')
-            
-        plt.xlabel('Iterations')
-        plt.ylabel('Radius (meters)')
-        plt.title(f'Finger Radius Optimization - {self.ycb_object_name}')
+            plt.plot(x, radii_array[:, i], label=f"Finger {i}")
+        plt.xlabel("Iterations")
+        plt.ylabel("Radius (meters)")
+        plt.title(f"Finger Radius Optimisation - {tag}")
         plt.grid(True)
         plt.legend()
-        plt.savefig(os.path.join(output_dir, f"plot_radius_{self.ycb_object_name}.png"))
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f"plot_radius_{tag}.png"), dpi=150)
         plt.close()
-        
+
         print(f"Plots saved to {output_dir}")
+
 
 
     def render(self):
@@ -965,6 +1229,9 @@ class InitializeFingers:
 
         # after convergence / before return
         self.capture_proxy_points_frozen() # for viz of cloth proxy points
+
+        # print rigid proxy volume estimates (and optional voxel reference)
+        self._print_rigid_proxy_volume_debug(finger_transform_for_ref_vox=init_trans)
         
         return init_trans, jq
     
