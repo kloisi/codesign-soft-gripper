@@ -587,9 +587,9 @@ class TendonModelBuilder(ModelBuilder):
                     edge_a="left",
                     edge_b="right",
                     dx_nominal=cell_size[0],
-                    mass_per_vertex=1e-4, # for 18x18 cloth: 18*18*0.0001 = 0.0324 = 30g
-                    tri_ke=1.0e1,
-                    tri_ka=1.0e1,
+                    mass_per_vertex=2.5e-5,
+                    tri_ke=1.0e0,
+                    tri_ka=1.0e0,
                     tri_kd=1.0e0,
                 )
 
@@ -887,7 +887,7 @@ class TendonModelBuilder(ModelBuilder):
 
         p_start = len(self.particle_q) # save cloth particle ids to enable cloth-finger collision
 
-        cloth_scale = 0.01 # 0.01
+        cloth_scale = 1.0 # 0.01
 
         self.add_cloth_grid(
             pos=cloth_pos,

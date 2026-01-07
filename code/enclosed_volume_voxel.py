@@ -198,8 +198,11 @@ class VoxelVolumeEstimator:
         top_y = q[self.top_rim_ids, 1]
         bot_y = q[self.bottom_rim_ids, 1]
 
-        y_top = float(np.percentile(top_y, 5.0)) # low side of top group, was 1.0
-        y_bottom = float(np.percentile(bot_y, 95.0)) # high side of bottom group, was 99.0
+        #y_top = float(np.percentile(top_y, 5.0)) # low side of top group, was 1.0
+        #y_bottom = float(np.percentile(bot_y, 95.0)) # high side of bottom group, was 99.0
+
+        y_top    = float(np.min(top_y))
+        y_bottom = float(np.max(bot_y))
 
         # build triangle xyz arrays
         cloth_tris_xyz = q[self.cloth_tri]  # (Tc,3,3)
@@ -229,8 +232,11 @@ class VoxelVolumeEstimator:
         mins = np.minimum(mins, q[self.rim_ids].min(axis=0))
         maxs = np.maximum(maxs, q[self.rim_ids].max(axis=0))
 
-        mins[1] = y_bottom
-        maxs[1] = y_top
+        # IMPORTANT: do NOT crop the grid to [y_bottom, y_top]
+        # We only use y_bottom/y_top to place caps later.
+        # But ensure the grid includes them:
+        mins[1] = min(mins[1], y_bottom)
+        maxs[1] = max(maxs[1], y_top)
 
         pad = self.cfg.pad_vox * self.cfg.voxel_size
         mins = mins - pad
@@ -261,17 +267,17 @@ class VoxelVolumeEstimator:
         cloth_wall = binary_dilation(cloth_surf, structure=structure, iterations=int(self.cfg.cloth_thickness_vox))
         blocked |= cloth_wall
 
-        # lid plane
+        t_lid = max(1, int(self.cfg.lid_thickness_vox))
         iy_lid = int(np.floor((y_top - origin[1]) / voxel))
         iy_lid = int(np.clip(iy_lid, 0, shape[1] - 1))
-        #iy1 = min(shape[1], iy_lid + max(1, int(self.cfg.lid_thickness_vox)))
-        blocked[:, iy_lid:, :] = True
+        blocked[:, iy_lid: min(shape[1], iy_lid + t_lid), :] = True
 
-        # lower cap plane
+        t_bot = max(1, int(self.cfg.lid_thickness_vox))
         iy_lower_cap = int(np.floor((y_bottom - origin[1]) / voxel))
-        iy_lower_cap= int(np.clip(iy_lower_cap, 0, shape[1] - 1))
-        # block everything below and including the lower cap plane
-        blocked[:, :iy_lower_cap + 1, :] = True
+        iy_lower_cap = int(np.clip(iy_lower_cap, 0, shape[1] - 1))
+        iy0 = max(0, iy_lower_cap - t_bot + 1)
+        blocked[:, iy0: iy_lower_cap + 1, :] = True
+
 
         # outside flood fill
         free = ~blocked
