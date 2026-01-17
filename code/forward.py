@@ -583,10 +583,176 @@ class FEMTendon:
         print(f"[{method_name}] Plots saved to {plot_filename}")
         plt.close(fig)
 
+# -------------------------
+# Cloth scaling + debug print (same logic as sweep_stiffness.py)
+# -------------------------
+def _safe_np(x):
+    if hasattr(x, "numpy"):
+        return x.numpy()
+    return np.asarray(x)
+
+
+def _get_cloth_ids_from_tendon(tendon):
+    # Prefer cached tendon.cloth_ids, else model.cloth_particle_ids, else builder
+    if getattr(tendon, "cloth_ids", None) is not None:
+        ids = np.asarray(tendon.cloth_ids, dtype=np.int64).ravel()
+        if ids.size:
+            return ids
+
+    model = getattr(tendon, "model", None)
+    if model is not None and getattr(model, "cloth_particle_ids", None) is not None:
+        try:
+            ids = _safe_np(model.cloth_particle_ids).astype(np.int64).ravel()
+            if ids.size:
+                return ids
+        except Exception:
+            pass
+
+    builder = getattr(tendon, "builder", None)
+    if builder is not None and getattr(builder, "cloth_particle_ids", None) is not None:
+        ids = np.asarray(builder.cloth_particle_ids, dtype=np.int64).ravel()
+        if ids.size:
+            return ids
+
+    return None
+
+
+def _tri_materials_np(model):
+    tri_mats = _safe_np(model.tri_materials)
+    tri_mats = np.asarray(tri_mats, dtype=np.float64)
+    if tri_mats.ndim == 1:
+        tri_mats = tri_mats.reshape(-1, 3)
+    return tri_mats
+
+
+def _tri_indices_np(model):
+    tri_idx = _safe_np(model.tri_indices)
+    tri_idx = np.asarray(tri_idx, dtype=np.int64)
+    if tri_idx.ndim == 1:
+        tri_idx = tri_idx.reshape(-1, 3)
+    return tri_idx
+
+
+def cloth_tri_mask(tendon):
+    model = getattr(tendon, "model", None)
+    if model is None or getattr(model, "tri_indices", None) is None:
+        return None, None, None
+
+    cloth_ids = _get_cloth_ids_from_tendon(tendon)
+    if cloth_ids is None or cloth_ids.size == 0:
+        return None, None, None
+
+    tri_idx = _tri_indices_np(model)
+    mask = np.isin(tri_idx, cloth_ids).any(axis=1)
+    if not np.any(mask):
+        return tri_idx, mask, cloth_ids
+
+    return tri_idx, mask, cloth_ids
+
+
+def print_cloth_material_stats(tendon, tag="", max_examples=3):
+    model = getattr(tendon, "model", None)
+    if model is None or getattr(model, "tri_materials", None) is None:
+        print(f"[cloth_mats]{tag} model.tri_materials missing")
+        return
+
+    tri_idx, mask, cloth_ids = cloth_tri_mask(tendon)
+    if tri_idx is None or mask is None:
+        print(f"[cloth_mats]{tag} no cloth ids / tri indices found")
+        return
+
+    tri_mats = _tri_materials_np(model)
+
+    n_total = int(tri_mats.shape[0])
+    n_cloth = int(np.sum(mask)) if mask is not None else 0
+    if n_cloth == 0:
+        print(f"[cloth_mats]{tag} cloth tris=0/{n_total} (mask empty)")
+        return
+
+    names = ["ke", "ka", "kd"]
+    stats_str = []
+    for j, nm in enumerate(names):
+        v = tri_mats[mask, j]
+        v = v[np.isfinite(v)]
+        if v.size == 0:
+            stats_str.append(f"{nm}=nan")
+            continue
+        stats_str.append(
+            f"{nm}: mean={np.mean(v):.4g} std={np.std(v):.3g} min={np.min(v):.4g} max={np.max(v):.4g}"
+        )
+
+    print(f"[cloth_mats]{tag} cloth tris={n_cloth}/{n_total} | " + " | ".join(stats_str))
+
+    ex = tri_mats[mask, :3]
+    ex = ex[: max_examples, :]
+    print(f"[cloth_mats]{tag} examples [ke, ka, kd] (first {ex.shape[0]} cloth tris):\n{ex}")
+
+
+def scale_cloth_stiffness(tendon, factor_ke_ka=1.0, factor_kd=1.0, debug=False):
+    model = getattr(tendon, "model", None)
+    if model is None or getattr(model, "tri_indices", None) is None or getattr(model, "tri_materials", None) is None:
+        print("[scale_cloth_stiffness] model tri data missing")
+        return
+
+    tri_idx, mask, cloth_ids = cloth_tri_mask(tendon)
+    if tri_idx is None or mask is None:
+        print("[scale_cloth_stiffness] no cloth ids / tri indices; nothing to scale")
+        return
+    if not np.any(mask):
+        print("[scale_cloth_stiffness] mask empty; no cloth tris found")
+        return
+
+    if debug:
+        print_cloth_material_stats(tendon, tag=" BEFORE_STIFF_SCALE")
+
+    tri_mats = _tri_materials_np(model).astype(np.float32, copy=False)
+
+    tri_mats[mask, 0] *= float(factor_ke_ka)  # ke
+    tri_mats[mask, 1] *= float(factor_ke_ka)  # ka
+    tri_mats[mask, 2] *= float(factor_kd)     # kd
+
+    model.tri_materials = wp.array(tri_mats, dtype=wp.float32, device=wp.get_device())
+    print(f"[scale_cloth_stiffness] scaled {int(np.sum(mask))} cloth tris: ke/ka x{factor_ke_ka} kd x{factor_kd}")
+
+    if debug:
+        print_cloth_material_stats(tendon, tag=" AFTER_STIFF_SCALE")
+
+
+def scale_cloth_mass(tendon, mass_factor: float, debug=False):
+    model = getattr(tendon, "model", None)
+    if model is None or getattr(model, "particle_inv_mass", None) is None:
+        print("[scale_cloth_mass] model or particle_inv_mass missing")
+        return
+
+    cloth_ids = _get_cloth_ids_from_tendon(tendon)
+    if cloth_ids is None or cloth_ids.size == 0:
+        print("[scale_cloth_mass] No cloth ids found; nothing to scale.")
+        return
+
+    inv_m = _safe_np(model.particle_inv_mass).astype(np.float32)
+
+    if debug:
+        before = inv_m[cloth_ids].copy()
+
+    for gid in cloth_ids:
+        if inv_m[gid] > 0.0:
+            m = 1.0 / inv_m[gid]
+            m *= float(mass_factor)
+            inv_m[gid] = 1.0 / max(m, 1e-12)
+
+    model.particle_inv_mass = wp.array(inv_m, dtype=wp.float32, device=wp.get_device())
+    print(f"[scale_cloth_mass] scaled {len(cloth_ids)} cloth vertices by mass_factor={mass_factor}")
+
+    if debug:
+        after = inv_m[cloth_ids]
+        # show a tiny summary
+        b = 1.0 / np.maximum(before, 1e-12)
+        a = 1.0 / np.maximum(after, 1e-12)
+        print(f"[scale_cloth_mass] cloth mass stats: mean before={np.mean(b):.4g} after={np.mean(a):.4g} (ratio~{np.mean(a)/np.mean(b):.3g})")
 
 
 def print_mass_breakdown(tendon):
-    """ADDED"""
+    """MW_ADDED"""
 
     m_model = tendon.model
     print("\nMASSES IN SCENE:")
@@ -701,6 +867,11 @@ if __name__ == "__main__":
     # expensive logging
     parser.add_argument("--no_voxvol", action="store_true", help="Disable voxel enclosed volume computation.")
 
+    parser.add_argument("--cloth_stiff_scale", type=float, default=1.0, help="Multiply cloth ke/ka by this factor.")
+    parser.add_argument("--cloth_damp_scale", type=float, default=1.0, help="Multiply cloth kd by this factor.")
+    parser.add_argument("--cloth_mass_scale", type=float, default=1.0, help="Multiply cloth mass by this factor.")
+    parser.add_argument("--debug_cloth_mats", action="store_true", help="Print cloth tri ke/ka/kd stats before/after scaling.")
+
 
     args = parser.parse_known_args()[0]
 
@@ -784,6 +955,26 @@ if __name__ == "__main__":
         
         if init_finger is not None and getattr(init_finger, "proxy_pts_frozen", None) is not None:
             tendon.proxy_pts_frozen = init_finger.proxy_pts_frozen
+
+        # --- apply cloth scaling exactly like sweep_stiffness.py (mass first, then ke/ka + kd)
+        if not args.no_cloth:
+            if args.debug_cloth_mats:
+                print_cloth_material_stats(tendon, tag=" BEFORE_ANY_SCALING")
+
+            if args.cloth_mass_scale != 1.0:
+                scale_cloth_mass(tendon, args.cloth_mass_scale, debug=False)
+
+            if (args.cloth_stiff_scale != 1.0) or (args.cloth_damp_scale != 1.0):
+                scale_cloth_stiffness(
+                    tendon,
+                    factor_ke_ka=args.cloth_stiff_scale,
+                    factor_kd=args.cloth_damp_scale,
+                    debug=args.debug_cloth_mats,   # prints before/after stiff scaling
+                )
+
+            if args.debug_cloth_mats:
+                print_cloth_material_stats(tendon, tag=" AFTER_ANY_SCALING")
+
 
         # --- optimize forces ---
         history = None

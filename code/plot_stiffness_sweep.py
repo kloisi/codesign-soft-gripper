@@ -22,6 +22,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 
 
 # -------------------------
@@ -233,23 +234,23 @@ def _apply_presentation_style(fig, font_scale=1.35, line_scale=1.8, marker_scale
         try:
             for im in ax.images:
                 try:
-                    cmap = im.get_cmap().copy()
-                    cmap.set_bad(color=(0.25, 0.25, 0.25, 1.0))
-                    im.set_cmap(cmap)
+                    cmap_ = im.get_cmap().copy()
+                    cmap_.set_bad(color=(0.25, 0.25, 0.25, 1.0))
+                    im.set_cmap(cmap_)
                 except Exception:
                     pass
         except Exception:
             pass
 
-        # Text annotations: make white + bump font
+        # Text annotations: make white + bump font + readable bbox
         try:
             for t in ax.texts:
                 try:
                     t.set_color("white")
                     t.set_fontsize(float(t.get_fontsize()) * font_scale)
-                    # add subtle bbox to keep readable on bright heatmap cells
                     if t.get_bbox_patch() is None:
-                        t.set_bbox(dict(facecolor="black", alpha=0.50, edgecolor="none", pad=0.4))
+                        # slightly opaque box for readability
+                        t.set_bbox(dict(facecolor="black", alpha=0.55, edgecolor="none", pad=0.4))
                 except Exception:
                     pass
         except Exception:
@@ -285,7 +286,7 @@ def savefig(out_dir, name):
     """
     os.makedirs(out_dir, exist_ok=True)
 
-    # 1) Original (unchanged)
+    # 1) Original
     path = os.path.join(out_dir, name)
     plt.tight_layout()
     plt.savefig(path, dpi=220)
@@ -315,6 +316,59 @@ def _marker_for_mass(m):
     return "o"
 
 
+def _color_map_for_damps(damp_vals, cmap_name="tab10"):
+    """
+    Returns dict {damp_value: rgba_or_hex_color}.
+    If cmap_name == "neon", use a saturated neon palette (good for PPT).
+    """
+    damp_vals = list(damp_vals)
+    if len(damp_vals) <= 0:
+        return {}
+
+    if str(cmap_name).lower() == "neon":
+        neon = [
+            "#00FFFF",  # neon cyan
+            "#FFFF00",  # neon yellow
+            "#FF00FF",  # neon pink
+            "#39FF14",  # neon green
+            "#FF5F1F",  # neon orange
+            "#7F00FF",  # neon purple
+        ]
+        out = {}
+        for i, d in enumerate(sorted(damp_vals)):
+            out[d] = neon[i % len(neon)]
+        return out
+
+    cmap = cm.get_cmap(cmap_name, max(3, len(damp_vals)))
+    out = {}
+    for i, d in enumerate(sorted(damp_vals)):
+        out[d] = cmap(i)
+    return out
+
+def _pareto_front_mask(x, y):
+    """
+    Returns a boolean mask of the non dominated points for MINIMISATION in both x and y.
+    A point i is dominated if there exists j with xj <= xi and yj <= yi and at least one strict.
+    """
+    x = np.asarray(x, dtype=float).ravel()
+    y = np.asarray(y, dtype=float).ravel()
+    good = np.isfinite(x) & np.isfinite(y)
+    mask = np.zeros_like(x, dtype=bool)
+
+    idx = np.where(good)[0]
+    for ii in idx:
+        dominated = False
+        for jj in idx:
+            if jj == ii:
+                continue
+            if (x[jj] <= x[ii]) and (y[jj] <= y[ii]) and ((x[jj] < x[ii]) or (y[jj] < y[ii])):
+                dominated = True
+                break
+        mask[ii] = (not dominated)
+    return mask
+
+
+
 def make_heatmap(
     piv: pd.DataFrame,
     title: str,
@@ -338,9 +392,9 @@ def make_heatmap(
 
     # Make masked (missing) values show as light gray instead of white.
     try:
-        cmap = im.get_cmap().copy()
-        cmap.set_bad(color=(0.88, 0.88, 0.88, 1.0))
-        im.set_cmap(cmap)
+        cmap_ = im.get_cmap().copy()
+        cmap_.set_bad(color=(0.88, 0.88, 0.88, 1.0))
+        im.set_cmap(cmap_)
     except Exception:
         pass
 
@@ -534,7 +588,6 @@ def load_npz_run_summary(npz_path, expect_fingers=None):
         vextra = _volume_curve_metrics(vol_t, vol_v)
 
         # Fix scalar volume metrics if curve provides better values
-        # (common case: scalar ended up 0/NaN but curve is fine)
         if (not np.isfinite(vol_final)) or (vol_final <= 0.0):
             if np.isfinite(vextra.get("v_final_curve", np.nan)) and vextra["v_final_curve"] > 0.0:
                 vol_final = float(vextra["v_final_curve"])
@@ -552,16 +605,14 @@ def load_npz_run_summary(npz_path, expect_fingers=None):
         if not np.isfinite(tail_cv) and np.isfinite(vextra.get("tail_cv_curve", np.nan)):
             tail_cv = float(vextra["tail_cv_curve"])
 
-
-        # --- rebound metric: how far final is above the minimum (>=1, lower is better)
+        # rebound metric: final / min (>=1, lower is better)
         denom = float(vol_min) if np.isfinite(vol_min) else np.nan
         if np.isfinite(vol_final) and np.isfinite(denom) and denom > 1e-12:
-            undershoot_rel = float((vol_final - denom) / denom)   # == final_to_min - 1
-            final_to_min = float(vol_final / denom)              # your preferred one
+            undershoot_rel = float((vol_final - denom) / denom)
+            final_to_min = float(vol_final / denom)
         else:
             undershoot_rel = np.nan
             final_to_min = np.nan
-
 
         # forces
         forces_final = z["forces_final"] if "forces_final" in z else None
@@ -634,7 +685,6 @@ def load_npz_run_summary(npz_path, expect_fingers=None):
             loss_len=loss_len,
             **fstats,
             **force_cols,
-            # keep curve-derived extras too (useful for plotting)
             **{k: vextra[k] for k in [
                 "vol_t10", "vol_t90", "vol_risetime_10_90", "vol_tail_std", "vol_tail_mean"
             ] if k in vextra},
@@ -684,6 +734,16 @@ def pick_representative_paths(runs_df, by="vol_final"):
         g["abs_dev"] = (g[by].astype(float) - med).abs()
         reps[key] = g.sort_values("abs_dev").iloc[0]["npz_path"]
     return reps
+
+
+def _single_run_mode(runs_used, keys):
+    """
+    True if every (stiff,mass,damp) has <= 1 successful run.
+    """
+    if runs_used is None or runs_used.empty:
+        return True
+    mx = int(runs_used.groupby(keys)["npz_path"].count().max())
+    return (mx <= 1)
 
 
 # -------------------------
@@ -770,8 +830,7 @@ def main():
     runs["tail_cv_safe"] = np.maximum(pd.to_numeric(runs["tail_cv"], errors="coerce").astype(float), 1e-12)
     runs["log10_tail_cv"] = np.log10(runs["tail_cv_safe"])
 
-    # SUCCESS FLAG:
-    # Treat seeds as redundancy: only "successful" runs contribute to ALL plots.
+    # success flag
     vol_eps = float(args.vol_eps)
     runs["vol_valid"] = (
         np.isfinite(pd.to_numeric(runs["vol_final"], errors="coerce").astype(float))
@@ -792,11 +851,12 @@ def main():
     dropped = len(runs_all) - len(runs_used)
     print(f"[INFO] successful runs: {len(runs_used)} / {len(runs_all)}  (dropped {dropped} due to vol_final <= {vol_eps} or NaN)")
 
+    keys = ["cloth_stiff_scale", "cloth_mass_scale", "cloth_damp_scale"]
+    one_run_mode = _single_run_mode(runs_used, keys)
+
     # -------------------------
     # Group across seeds (present vs used)
     # -------------------------
-    keys = ["cloth_stiff_scale", "cloth_mass_scale", "cloth_damp_scale"]
-
     present = (
         runs_all.groupby(keys, as_index=False)
         .agg(
@@ -823,7 +883,7 @@ def main():
         "tail_cv": ["mean", "std"],
         "log10_tail_cv": ["mean", "std"],
         "overshoot_rel": ["mean", "std"],
-        "final_to_min": ["mean", "std"], 
+        "final_to_min": ["mean", "std"],
         "forces_mean": ["mean", "std"],
         "forces_max": ["mean", "std"],
         "forces_std": ["mean", "std"],
@@ -859,7 +919,6 @@ def main():
                 flat_cols.append(col)
         g_metrics.columns = flat_cols
     else:
-        # no successful runs at all
         g_metrics = present.copy()
 
     # merge present + used counts + metrics
@@ -885,7 +944,7 @@ def main():
     stiff_vals = sorted(g["cloth_stiff_scale"].unique().tolist())
 
     # -------------------------
-    # Heatmaps per mass scale (SUCCESSFUL ONLY)
+    # Heatmaps per mass scale
     # -------------------------
     def heatmap_metric(metric_mean_col, title_prefix, cbar, fname_prefix):
         if metric_mean_col not in g.columns:
@@ -899,7 +958,7 @@ def main():
                 values=metric_mean_col,
             ).reindex(index=stiff_vals, columns=damp_vals)
 
-            fmt = "{:.4f}" if metric_mean_col.startswith("final_to_min") else "{:.3g}" # shows 1.0000, 1.0030, etc
+            fmt = "{:.4f}" if metric_mean_col.startswith("final_to_min") else "{:.4f}" if metric_mean_col.startswith("vol_final") else "{:.3g}"
 
             make_heatmap(
                 piv=piv,
@@ -913,9 +972,9 @@ def main():
                 annot_fmt=fmt,
             )
 
+    # keep the old per-mass heatmaps
     heatmap_metric("vol_final_mean", "vol_final", "vol_final", "heat_vol_final")
-    #heatmap_metric("overshoot_rel_mean", "overshoot_rel", "overshoot_rel", "heat_overshoot")
-    heatmap_metric("final_to_min_mean", "Final/Min (rebound ratio)", "Final/Min", "heat_final_to_min")
+    heatmap_metric("final_to_min_mean", "V_final / V_min (rebound ratio)", "V_final / V_min", "heat_final_to_min")
     heatmap_metric("log10_tail_cv_mean", "log10(tail_cv)", "log10(tail_cv)", "heat_logtailcv")
     heatmap_metric("t95_mean", "t95", "t95 [s]", "heat_t95")
     heatmap_metric("vol_risetime_10_90_mean", "volume risetime 10 to 90", "t90 - t10 [s]", "heat_risetime_10_90")
@@ -928,7 +987,71 @@ def main():
     heatmap_metric("obj_disp_mean", "object displacement magnitude", "||obj_end - obj0||", "heat_obj_disp")
     heatmap_metric("p0_disp_mean", "first particle displacement magnitude", "||p0_end - p00||", "heat_p0_disp")
 
-    # coverage heatmaps
+    # NEW: mass-averaged vol_final heatmap (averaging over mass for each (stiff, damp))
+    # This is what you asked for: damp/stiff pattern without mass-specific quirks.
+    if "vol_final_mean" in g.columns and len(mass_vals) > 1:
+        g_ok = g[g["run_count_used"] > 0].copy()
+        g_ok["vol_final_mean"] = pd.to_numeric(g_ok["vol_final_mean"], errors="coerce")
+
+        g_massavg = (
+            g_ok.groupby(["cloth_stiff_scale", "cloth_damp_scale"], as_index=False)
+            .agg(
+                vol_final_massavg=("vol_final_mean", "mean"),
+                mass_count=("cloth_mass_scale", "nunique"),
+            )
+        )
+
+        piv = g_massavg.pivot(
+            index="cloth_stiff_scale",
+            columns="cloth_damp_scale",
+            values="vol_final_massavg",
+        ).reindex(index=stiff_vals, columns=damp_vals)
+
+        make_heatmap(
+            piv=piv,
+            title="vol_final (average over mass_scale)",
+            xlabel="cloth_damp_scale (kd)",
+            ylabel="cloth_stiff_scale (ke/ka)",
+            cbar_label="vol_final",
+            out_dir=out_dir,
+            filename="heat_vol_final_massavg.png",
+            annotate=annotate,
+            annot_fmt="{:.4f}",
+        )
+
+    # NEW: mass-averaged final_to_min heatmap (averaging over mass for each (stiff, damp))
+    if "final_to_min_mean" in g.columns and len(mass_vals) > 1:
+        g_ok = g[g["run_count_used"] > 0].copy()
+        g_ok["final_to_min_mean"] = pd.to_numeric(g_ok["final_to_min_mean"], errors="coerce")
+
+        g_massavg = (
+            g_ok.groupby(["cloth_stiff_scale", "cloth_damp_scale"], as_index=False)
+            .agg(
+                final_to_min_massavg=("final_to_min_mean", "mean"),
+                mass_count=("cloth_mass_scale", "nunique"),
+            )
+        )
+
+        piv = g_massavg.pivot(
+            index="cloth_stiff_scale",
+            columns="cloth_damp_scale",
+            values="final_to_min_massavg",
+        ).reindex(index=stiff_vals, columns=damp_vals)
+
+        make_heatmap(
+            piv=piv,
+            title="V_final / V_min (average over mass_scale)",
+            xlabel="cloth_damp_scale (kd)",
+            ylabel="cloth_stiff_scale (ke/ka)",
+            cbar_label="V_final / V_min",
+            out_dir=out_dir,
+            filename="heat_final_to_min_massavg.png",
+            annotate=annotate,
+            annot_fmt="{:.4f}",
+        )
+
+
+    # coverage heatmaps (kept)
     for m in mass_vals:
         gm = g[np.isclose(g["cloth_mass_scale"], m)].copy()
 
@@ -947,7 +1070,7 @@ def main():
         piv = gm.pivot(index="cloth_stiff_scale", columns="cloth_damp_scale", values="seed_count_used").reindex(index=stiff_vals, columns=damp_vals)
         make_heatmap(
             piv,
-            title=f"seed_count_used (successful)  mass_scale={m}",
+            title=f"seed_count_used  mass_scale={m}",
             xlabel="cloth_damp_scale",
             ylabel="cloth_stiff_scale",
             cbar_label="seed_count_used",
@@ -956,7 +1079,7 @@ def main():
             annotate=annotate,
         )
 
-    # per finger heatmaps (optional)
+    # per finger heatmaps (optional, kept)
     if (not args.no_per_finger) and force_cols:
         for m in mass_vals:
             gm = g[np.isclose(g["cloth_mass_scale"], m)].copy()
@@ -967,17 +1090,17 @@ def main():
                 piv = gm.pivot(index="cloth_stiff_scale", columns="cloth_damp_scale", values=mean_col).reindex(index=stiff_vals, columns=damp_vals)
                 make_heatmap(
                     piv,
-                    title=f"{fc} (mean final force, successful only)  mass_scale={m}",
+                    title=f"{fc}  mass_scale={m}",
                     xlabel="cloth_damp_scale",
                     ylabel="cloth_stiff_scale",
-                    cbar_label=f"{fc} mean",
+                    cbar_label=f"{fc}",
                     out_dir=out_dir,
                     filename=f"heat_{fc}_mass{_sanitize_token(m)}.png",
                     annotate=annotate,
                 )
 
     # -------------------------
-    # Trend plots vs stiffness (SUCCESSFUL ONLY)
+    # Trend plots vs stiffness
     # -------------------------
     def plot_trends(metric_mean_col, ylabel, fname, logy=False):
         if metric_mean_col not in g.columns:
@@ -1008,41 +1131,162 @@ def main():
         plt.legend(fontsize=8, ncol=2)
         savefig(out_dir, fname)
 
-    plot_trends("vol_final_mean", "vol_final mean", "trend_vol_final_vs_stiff.png", logy=False)
-    #plot_trends("overshoot_rel_mean", "overshoot_rel mean", "trend_overshoot_vs_stiff.png", logy=False)
-    plot_trends("final_to_min_mean", "Final/Min mean (lower is better)", "trend_final_to_min_vs_stiff.png", logy=False)
-    plot_trends("tail_cv_mean", "tail_cv mean", "trend_tailcv_vs_stiff.png", logy=True)
-    plot_trends("t95_mean", "t95 mean [s]", "trend_t95_vs_stiff.png", logy=False)
+    # if you only ran 1 seed, these are basically values; label them simply
+    plot_trends("vol_final_mean", "vol_final", "trend_vol_final_vs_stiff.png", logy=False)
+    plot_trends("final_to_min_mean", "V_final / V_min (lower is better)", "trend_final_to_min_vs_stiff.png", logy=False)
+    plot_trends("tail_cv_mean", "tail_cv", "trend_tailcv_vs_stiff.png", logy=True)
+    plot_trends("t95_mean", "t95 [s]", "trend_t95_vs_stiff.png", logy=False)
     plot_trends("forces_mean_mean", "forces mean (final)", "trend_forces_mean_vs_stiff.png", logy=False)
     plot_trends("forces_max_mean", "forces max (final)", "trend_forces_max_vs_stiff.png", logy=False)
     plot_trends("diff_norm_end_mean", "end translation mismatch", "trend_diff_norm_end_vs_stiff.png", logy=False)
 
     # -------------------------
-    # Pareto scatter plots (SUCCESSFUL ONLY)
+    # Pareto scatter plots (mass=1.0), improved colors + circles
     # -------------------------
-
-    # only consider mass 1.0
     g_p = g.copy()
     g_p = g_p[g_p["run_count_used"] > 0].copy()
     g_p = g_p[np.isclose(g_p["cloth_mass_scale"], 1.0)].copy()
 
+    damp_color = _color_map_for_damps(damp_vals, cmap_name="neon")
+
+    # Pareto: vol_final vs V_final/V_min
     plt.figure(figsize=(8.4, 5.8))
     for _, r in g_p.iterrows():
         x = _as_float(r.get("final_to_min_mean", np.nan))
         y = _as_float(r.get("vol_final_mean", np.nan))
         if not (np.isfinite(x) and np.isfinite(y)):
             continue
-        m = _as_float(r.get("cloth_mass_scale", np.nan))
+        d = _as_float(r.get("cloth_damp_scale", np.nan))
         s = r.get("cloth_stiff_scale", np.nan)
-        d = r.get("cloth_damp_scale", np.nan)
-        plt.scatter(x, y, marker=_marker_for_mass(m), alpha=0.9)
-        plt.annotate(f"s={s}, d={d}, m={m}", (x, y), textcoords="offset points", xytext=(4, 3), fontsize=7, alpha=0.8)
-    plt.xlabel("V_final/V_min (lower is better)")
+        col = damp_color.get(d, None)
+        plt.scatter(x, y, marker="o", alpha=0.9, c=[col] if col is not None else None)
+        plt.annotate(f"s={s}, d={d}", (x, y), textcoords="offset points", xytext=(4, 3), fontsize=7, alpha=0.8)
+
+    # legend for damping colors
+    try:
+        handles = []
+        for d in sorted(damp_color.keys()):
+            handles.append(plt.Line2D([0], [0], marker="o", linestyle="", color=damp_color[d], label=f"d={d}"))
+        if handles:
+            plt.legend(handles=handles, fontsize=8, ncol=2, title="damp")
+    except Exception:
+        pass
+
+    plt.xlabel("V_final / V_min (lower is better)")
     plt.ylabel("V_final (lower is better)")
-    plt.title("Pareto view: Final volume (V_final) vs V_final/V_min")
+    plt.title("Pareto: V_final vs V_final / V_min (mass=1.0)")
     plt.grid(True, alpha=0.3)
     savefig(out_dir, "pareto_vol_vs_final_to_min.png")
 
+    # -------------------------
+    # EXTRA: cleaner Pareto views (keep the original plot as-is)
+    # -------------------------
+
+    # Collect valid points once
+    pts = g_p[["final_to_min_mean", "vol_final_mean", "cloth_stiff_scale", "cloth_damp_scale"]].copy()
+    for c in ["final_to_min_mean", "vol_final_mean", "cloth_stiff_scale", "cloth_damp_scale"]:
+        pts[c] = pd.to_numeric(pts[c], errors="coerce")
+    pts = pts[np.isfinite(pts["final_to_min_mean"]) & np.isfinite(pts["vol_final_mean"])].copy()
+
+    if len(pts) > 0:
+        xs = pts["final_to_min_mean"].to_numpy(dtype=float)
+        ys = pts["vol_final_mean"].to_numpy(dtype=float)
+
+        # ---------- (A) Pareto front highlighted: dominated points grey, only front annotated ----------
+        front = _pareto_front_mask(xs, ys)
+
+        plt.figure(figsize=(8.4, 5.8))
+
+        # dominated background
+        if np.any(~front):
+            plt.scatter(xs[~front], ys[~front], marker="o", c="#888888", alpha=0.30, s=55)
+
+        # highlight Pareto front, coloured by damping
+        for d in sorted(damp_vals):
+            sel = np.isclose(pts["cloth_damp_scale"].to_numpy(dtype=float), float(d)) & front
+            if not np.any(sel):
+                continue
+            col = damp_color.get(d, None)
+            plt.scatter(
+                xs[sel],
+                ys[sel],
+                marker="o",
+                alpha=0.95,
+                s=95,
+                c=[col] if col is not None else None,
+            )
+
+            # annotate only the front points (stiff only, much less clutter)
+            stiff_sel = pts.loc[sel, "cloth_stiff_scale"].to_numpy(dtype=float)
+            for x0, y0, s0 in zip(xs[sel], ys[sel], stiff_sel):
+                plt.annotate(
+                    f"s={s0:g}",
+                    (x0, y0),
+                    textcoords="offset points",
+                    xytext=(5, 4),
+                    fontsize=8,
+                    alpha=0.90,
+                )
+
+        # legend only for damps that appear on the front
+        try:
+            front_damps = sorted(set(pts.loc[front, "cloth_damp_scale"].to_numpy(dtype=float).tolist()))
+            handles = []
+            for d in front_damps:
+                col = damp_color.get(d, None)
+                handles.append(plt.Line2D([0], [0], marker="o", linestyle="", color=col if col is not None else "C0", label=f"d={d:g}"))
+            if handles:
+                plt.legend(handles=handles, fontsize=8, ncol=2, title="Pareto front damp")
+        except Exception:
+            pass
+
+        plt.xlabel("V_final / V_min (lower is better)")
+        plt.ylabel("V_final (lower is better)")
+        plt.title("Pareto (clean): dominated grey, Pareto front highlighted (mass=1.0)")
+        plt.grid(True, alpha=0.3)
+        savefig(out_dir, "pareto_vol_vs_final_to_min_front.png")
+
+        # ---------- (B) Lines by damping, sorted by stiffness (trend view, no per-point labels) ----------
+        plt.figure(figsize=(8.4, 5.8))
+        any_line = False
+        for d in sorted(damp_vals):
+            gd = g_p[np.isclose(g_p["cloth_damp_scale"], float(d))].copy()
+            if gd.empty:
+                continue
+
+            gd["final_to_min_mean"] = pd.to_numeric(gd["final_to_min_mean"], errors="coerce")
+            gd["vol_final_mean"] = pd.to_numeric(gd["vol_final_mean"], errors="coerce")
+            gd["cloth_stiff_scale"] = pd.to_numeric(gd["cloth_stiff_scale"], errors="coerce")
+            gd = gd[np.isfinite(gd["final_to_min_mean"]) & np.isfinite(gd["vol_final_mean"]) & np.isfinite(gd["cloth_stiff_scale"])].copy()
+            if len(gd) < 2:
+                continue
+
+            gd = gd.sort_values("cloth_stiff_scale")
+            xsd = gd["final_to_min_mean"].to_numpy(dtype=float)
+            ysd = gd["vol_final_mean"].to_numpy(dtype=float)
+            col = damp_color.get(float(d), None)
+
+            plt.plot(xsd, ysd, "-o", alpha=0.90, color=col if col is not None else None, label=f"d={float(d):g}")
+            any_line = True
+
+            # label endpoints only (gives orientation without clutter)
+            s_first = float(gd["cloth_stiff_scale"].iloc[0])
+            s_last = float(gd["cloth_stiff_scale"].iloc[-1])
+            plt.annotate(f"s={s_first:g}", (xsd[0], ysd[0]), textcoords="offset points", xytext=(6, 4), fontsize=8, alpha=0.85)
+            plt.annotate(f"s={s_last:g}", (xsd[-1], ysd[-1]), textcoords="offset points", xytext=(6, 4), fontsize=8, alpha=0.85)
+
+        if any_line:
+            plt.legend(fontsize=8, ncol=2, title="damp")
+            plt.xlabel("V_final / V_min (lower is better)")
+            plt.ylabel("V_final (lower is better)")
+            plt.title("Pareto trend lines by damping (points ordered by stiffness, mass=1.0)")
+            plt.grid(True, alpha=0.3)
+            savefig(out_dir, "pareto_vol_vs_final_to_min_lines_by_damp.png")
+        else:
+            plt.close()
+
+
+    # Pareto: vol_final vs tail_cv
     plt.figure(figsize=(8.4, 5.8))
     for _, r in g_p.iterrows():
         x = _as_float(r.get("tail_cv_mean", np.nan))
@@ -1050,34 +1294,56 @@ def main():
         if not (np.isfinite(x) and np.isfinite(y)):
             continue
         x = max(float(x), 1e-12)
-        m = _as_float(r.get("cloth_mass_scale", np.nan))
+        d = _as_float(r.get("cloth_damp_scale", np.nan))
         s = r.get("cloth_stiff_scale", np.nan)
-        d = r.get("cloth_damp_scale", np.nan)
-        plt.scatter(x, y, marker=_marker_for_mass(m), alpha=0.9)
-        plt.annotate(f"s={s}, d={d}, m={m}", (x, y), textcoords="offset points", xytext=(4, 3), fontsize=7, alpha=0.8)
+        col = damp_color.get(d, None)
+        plt.scatter(x, y, marker="o", alpha=0.9, c=[col] if col is not None else None)
+        plt.annotate(f"s={s}, d={d}", (x, y), textcoords="offset points", xytext=(4, 3), fontsize=7, alpha=0.8)
+
+    try:
+        handles = []
+        for d in sorted(damp_color.keys()):
+            handles.append(plt.Line2D([0], [0], marker="o", linestyle="", color=damp_color[d], label=f"d={d}"))
+        if handles:
+            plt.legend(handles=handles, fontsize=8, ncol=2, title="damp")
+    except Exception:
+        pass
+
     plt.xscale("log")
     plt.xlabel("tail_cv (log scale, lower is better)")
-    plt.ylabel("vol_final (lower is better)")
-    plt.title("Pareto view: vol_final vs tail_cv")
+    plt.ylabel("V_final (lower is better)")
+    plt.title("Pareto: V_final vs tail_cv (mass=1.0)")
     plt.grid(True, alpha=0.3)
     savefig(out_dir, "pareto_vol_vs_tailcv.png")
 
+    # Pareto: vol_final vs forces_max
     plt.figure(figsize=(8.4, 5.8))
     for _, r in g_p.iterrows():
         x = _as_float(r.get("forces_max_mean", np.nan))
         y = _as_float(r.get("vol_final_mean", np.nan))
         if not (np.isfinite(x) and np.isfinite(y)):
             continue
-        m = _as_float(r.get("cloth_mass_scale", np.nan))
-        plt.scatter(x, y, marker=_marker_for_mass(m), alpha=0.9)
+        d = _as_float(r.get("cloth_damp_scale", np.nan))
+        col = damp_color.get(d, None)
+        plt.scatter(x, y, marker="o", alpha=0.9, c=[col] if col is not None else None)
+
+    try:
+        handles = []
+        for d in sorted(damp_color.keys()):
+            handles.append(plt.Line2D([0], [0], marker="o", linestyle="", color=damp_color[d], label=f"d={d}"))
+        if handles:
+            plt.legend(handles=handles, fontsize=8, ncol=2, title="damp")
+    except Exception:
+        pass
+
     plt.xlabel("forces max (final)")
-    plt.ylabel("vol_final")
-    plt.title("Tradeoff: final force peak vs volume stability")
+    plt.ylabel("V_final")
+    plt.title("Tradeoff: final force peak vs volume stability (mass=1.0)")
     plt.grid(True, alpha=0.3)
     savefig(out_dir, "pareto_vol_vs_forces_max.png")
 
     # -------------------------
-    # Force distribution plots (successful only)
+    # Force distribution plots (kept)
     # -------------------------
     if force_cols and len(runs_used) > 0:
         all_forces = []
@@ -1092,11 +1358,11 @@ def main():
             plt.hist(all_forces, bins=40)
             plt.xlabel("final per finger force")
             plt.ylabel("count")
-            plt.title("Distribution of final per finger forces (successful runs only)")
+            plt.title("Distribution of final per finger forces")
             plt.grid(True, alpha=0.3)
             savefig(out_dir, "hist_all_final_forces_successful.png")
 
-    # per finger vs stiffness (baseline mass=1, damp=1 if exists)
+    # per finger vs stiffness (kept)
     if (not args.no_per_finger) and force_cols:
         baseline_mass = 1.0 if 1.0 in mass_vals else mass_vals[len(mass_vals)//2]
         baseline_damp = 1.0 if 1.0 in damp_vals else damp_vals[len(damp_vals)//2]
@@ -1118,14 +1384,14 @@ def main():
                 )
             plt.xscale("log")
             plt.xlabel("cloth_stiff_scale")
-            plt.ylabel("mean final force")
-            plt.title(f"Per finger mean final force vs stiffness (successful only, mass={baseline_mass}, damp={baseline_damp})")
+            plt.ylabel("final force")
+            plt.title(f"Per finger final force vs stiffness (mass={baseline_mass}, damp={baseline_damp})")
             plt.grid(True, alpha=0.3)
             plt.legend(fontsize=8, ncol=3)
             savefig(out_dir, f"perfinger_force_vs_stiff_mass{_sanitize_token(baseline_mass)}_damp{_sanitize_token(baseline_damp)}.png")
 
     # -------------------------
-    # Time series plots (successful only)
+    # Time series plots (kept)
     # -------------------------
     if not args.no_timeseries:
         if len(runs_used) == 0:
@@ -1202,13 +1468,10 @@ def main():
                 else:
                     plt.close(fig)
 
-            # Loss curves: pick a few representative combos based on g (successful-only metrics)
+            # Representative loss curves
             g_rank = g.copy()
             g_rank["vol_final_mean"] = pd.to_numeric(g_rank.get("vol_final_mean", np.nan), errors="coerce")
-            #g_rank["overshoot_rel_mean"] = pd.to_numeric(g_rank.get("overshoot_rel_mean", np.nan), errors="coerce")
             g_rank["final_to_min_mean"] = pd.to_numeric(g_rank.get("final_to_min_mean", np.nan), errors="coerce")
-
-            # only combos that actually have successful runs
             g_rank = g_rank[g_rank["run_count_used"] > 0].copy()
             g_rank = g_rank[np.isfinite(g_rank["vol_final_mean"])].copy()
 
@@ -1216,7 +1479,6 @@ def main():
             if not g_rank.empty:
                 picks += g_rank.sort_values("vol_final_mean").head(2).to_dict("records")
                 picks += g_rank.sort_values("vol_final_mean", ascending=False).head(2).to_dict("records")
-                #picks += g_rank.sort_values("overshoot_rel_mean", ascending=False).head(2).to_dict("records")
                 picks += g_rank.sort_values("final_to_min_mean", ascending=False).head(2).to_dict("records")
 
             seen = set()
@@ -1244,7 +1506,7 @@ def main():
                     plt.plot(lc, linestyle="-", marker=None, alpha=0.9, label=f"s={k[0]}, m={k[1]}, d={k[2]}")
                 plt.xlabel("optimiser step")
                 plt.ylabel("loss")
-                plt.title("Representative optimiser loss curves (successful only)")
+                plt.title("Representative optimiser loss curves")
                 plt.grid(True, alpha=0.3)
                 plt.legend(fontsize=8, ncol=2)
                 savefig(out_dir, "timeseries_loss_curves_representative.png")
@@ -1266,11 +1528,11 @@ def main():
 
         g_ok = g[g["run_count_used"] > 0].copy()
         if not g_ok.empty and "vol_final_mean" in g_ok.columns:
-            print("\n[INFO] best (lowest vol_final_mean, successful only):")
+            print("\n[INFO] best (lowest vol_final):")
             print(g_ok.sort_values("vol_final_mean").head(8)[keep].to_string(index=False))
 
         if not g_ok.empty and "final_to_min_mean" in g_ok.columns:
-            print("\n[INFO] worst final_to_min_mean (successful only):")
+            print("\n[INFO] worst V_final/V_min:")
             print(g_ok.sort_values("final_to_min_mean", ascending=False).head(8)[keep].to_string(index=False))
 
     print(f"\n[OK] All plots saved to: {out_dir}")
