@@ -1,5 +1,7 @@
 # integrator_euler_fem.py
 
+"""mostly adopted from codesign gripper git repo, with some modifications for cloth-finger collisions"""
+
 import warp as wp
 from warp.sim.integrator_euler import *
 from warp.sim.model import PARTICLE_FLAG_ACTIVE, Control, Model, ModelShapeGeometry, ModelShapeMaterials, State

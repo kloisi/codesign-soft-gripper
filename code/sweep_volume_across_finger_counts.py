@@ -1,4 +1,4 @@
-# sweep_finger_count.py
+# sweep_volume_across_finger_counts.py
 #
 # Sweep over coral meshes and finger counts.
 # For each (coral, n_fingers):
@@ -41,7 +41,7 @@ from forward import FEMTendon, InitializeFingers
 
 
 # ----------------------------
-# CONFIG (keep your commented full lists)
+# CONFIG (keep commented full lists)
 # ----------------------------
 
 # --- TEST SET (keep small while debugging) ---
@@ -239,7 +239,7 @@ def _patch_voxvol_init_final_only(tendon: FEMTendon):
     cache = {"have_t0": False, "vol0": None, "dbg0": None}
 
     def compute_wrapped(q, solid_tri_sets=None, return_points=False, max_points=40000):
-        # final frame call uses return_points=True in your forward.py
+        # final frame call uses return_points=True in forward.py
         if return_points:
             # compute final but do not generate point clouds (saves time and memory)
             vol, dbg = real_compute(q, solid_tri_sets=solid_tri_sets, return_points=False, max_points=max_points)
@@ -371,7 +371,7 @@ def run_one_case(
             # --------------------------
             tendon = FEMTendon(
                 stage_path=None,
-                num_frames=sim_num_frames,      # full sim frames, same as your forward run
+                num_frames=sim_num_frames,      # full sim frames, same as forward run
                 verbose=False,
                 save_log=False,
                 train_iters=1,
@@ -626,7 +626,7 @@ def main():
     pose_opt_frames = 30
     pose_opt_iters = 2000
 
-    # Sim length (this is the same as your forward style run)
+    # Sim length (this is the same as forward style run)
     sim_num_frames = 1000
 
     # Force optimisation
@@ -634,7 +634,7 @@ def main():
     force_opt_lr = 1.0
     force_opt_frames = 100
 
-    # keep your test and full lists
+    # keep test and full lists
     object_list = OBJECT_LIST_FULL
     finger_counts = FINGER_COUNTS_FULL
 

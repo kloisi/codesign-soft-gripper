@@ -6,18 +6,13 @@ from dataclasses import dataclass
 from scipy.ndimage import binary_dilation, binary_fill_holes, binary_propagation, binary_erosion
 
 """
-Voxel-based enclosed volume estimator
+Voxel enclosed volume estimate
 
-Pipeline:
-  1) Voxelize cloth surface -> thicken -> treated as blocked
-  2) Voxelize non-cloth surfaces -> thicken -> fill holes -> treated as blocked
-  3) Add a lid plane (above the opening) and a bottom plane cap (below) as blocked
-  4) Flood-fill free space from the grid boundary to mark "outside"
-  5) Enclosed volume = free voxels that are not reachable from outside
-
-Notes:
-- The estimator needs a one-time rim calibration on q0 to identify top/bottom rim vertices.
-- The voxel grid is rebuilt every call from current cloth/solid bounds (fast enough our use).
+  1) Voxelize cloth surface -> treat as blocked
+  2) Voxelize non-cloth surfaces -> treat as blocked
+  3) Add a lid plane above the opening and a bottom plane cap below -> blocked
+  4) Flood-fill free space from the grid boundary to mark -> outside
+  5) Enclosed volume = free voxels that are not reachable by the flood fill from outside
 """
 
 @dataclass(frozen=True)
@@ -74,7 +69,7 @@ def prepare_vox_topology_from_model(model):
     cloth_ids = cloth_ids.numpy() if hasattr(cloth_ids, "numpy") else np.asarray(cloth_ids)
     cloth_ids = np.asarray(cloth_ids, dtype=np.int64).ravel()
 
-    # IMPORTANT: welded cloth uses finger boundary vertices, so use ANY not ALL
+    # welded cloth uses finger boundary vertices, so use any and not all
     is_cloth_tri = np.isin(tri, cloth_ids).any(axis=1)
 
     cloth_tris = tri[is_cloth_tri]
@@ -97,7 +92,7 @@ def _points_to_voxels(points_xyz, origin_xyz, voxel_size, shape):
 
 def _sample_triangle_points(v0, v1, v2, step):
     """
-    Vectorized barycentric sampling (no nested Python loops)
+    vectorized barycentric sampling
     """
     v0 = np.asarray(v0, dtype=np.float64)
     v1 = np.asarray(v1, dtype=np.float64)
@@ -221,7 +216,7 @@ class VoxelVolumeEstimator:
                 else:
                     raise ValueError("solid_tri_sets entries must be (T,3) indices or (T,3,3) xyz.")
 
-        # bounds (min/max) without building a giant vstack
+        # bounds min/max
         mins = cloth_tris_xyz.reshape(-1, 3).min(axis=0)
         maxs = cloth_tris_xyz.reshape(-1, 3).max(axis=0)
 
@@ -232,9 +227,8 @@ class VoxelVolumeEstimator:
         mins = np.minimum(mins, q[self.rim_ids].min(axis=0))
         maxs = np.maximum(maxs, q[self.rim_ids].max(axis=0))
 
-        # IMPORTANT: do NOT crop the grid to [y_bottom, y_top]
-        # We only use y_bottom/y_top to place caps later.
-        # But ensure the grid includes them:
+        # do NOT crop the grid to [y_bottom, y_top]
+        # use y_bottom/y_top to place caps later, but ensure the grid includes them
         mins[1] = min(mins[1], y_bottom)
         maxs[1] = max(maxs[1], y_top)
 
