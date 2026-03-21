@@ -92,9 +92,12 @@ def quick_visualize(tendon,
         return
 
     model = tendon.model
-    states = tendon.states
-    num_frames = tendon.num_frames
-    sim_substeps = tendon.sim_substeps
+    particle_frames = getattr(tendon, "saved_particle_q", None)
+    body_frames = getattr(tendon, "saved_body_q", None)
+
+    if not particle_frames:
+        print("quick_viz: no saved frames found, run tendon.forward(save_for_viz=True) first")
+        return
 
     # cloth ids
     if hasattr(model, "cloth_particle_ids") and model.cloth_particle_ids is not None:
@@ -228,10 +231,8 @@ def quick_visualize(tendon,
 
 
     # collect frames
-    for f in range(0, num_frames + 1, stride):
-        state = states[f * sim_substeps]
-
-        q = state.particle_q.numpy()
+    for f, q in enumerate(particle_frames):
+        q = np.asarray(q)
         if q.ndim == 3:
             q = q[0]
 
@@ -242,8 +243,8 @@ def quick_visualize(tendon,
             P_cloth = q[cloth_ids]
             P_list.append(P_cloth)
 
-        if obj_local is not None:
-            bq = state.body_q.numpy()
+        if obj_local is not None and body_frames is not None and f < len(body_frames):
+            bq = np.asarray(body_frames[f])
             if bq.ndim == 3:
                 bq = bq[0]
             pos = bq[0, :3]
@@ -392,7 +393,11 @@ def plot_last_frame_with_voxels(tendon, dbg, save_path="debug/vox_overlay.png",
     import numpy as np
     import matplotlib.pyplot as plt
 
-    q = tendon.states[-1].particle_q.numpy()
+    if getattr(tendon, "saved_particle_q", None):
+        q = np.asarray(tendon.saved_particle_q[-1])
+    else:
+        q = tendon.state_a.particle_q.numpy()
+
     if q.ndim == 3:
         q = q[0]
 

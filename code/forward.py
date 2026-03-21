@@ -193,18 +193,22 @@ class FEMTendon:
         self.init_materials()
 
         # allocate sim states
-        self.states = []
-        for i in range(self.sim_substeps * self.num_frames + 1):
-            self.states.append(self.model.state(requires_grad=self.requires_grad))
-        self.init_particle_q = self.states[0].particle_q.numpy()[0, :]
+        self.state_a = self.model.state(requires_grad=self.requires_grad)
+        self.state_b = self.model.state(requires_grad=self.requires_grad)
+
+        self.init_particle_q = self.state_a.particle_q.numpy()[0, :]
         if self.has_object:
-            self.init_body_q = self.states[0].body_q.numpy()[0, :]
-            self.object_body_f = self.states[0].body_f
-            self.object_q = self.states[0].body_q
+            self.init_body_q = self.state_a.body_q.numpy()[0, :]
+            self.object_body_f = self.state_a.body_f
+            self.object_q = self.state_a.body_q
         else:
             self.init_body_q = None
             self.object_body_f = None
             self.object_q = None
+
+        # CPU snapshots for quick viz
+        self.saved_particle_q = []
+        self.saved_body_q = []
 
         if self.stage_path and is_render:
             self.renderer = TendonRenderer(self.model, self.stage_path, scaling=1.0)
@@ -284,26 +288,36 @@ class FEMTendon:
                 inputs=[self.log_K_warp, self.v, self.tet_block_ids],
                 outputs=[self.model.tet_materials])
 
-    def forward(self):
+    def forward(self, save_stride=1, save_for_viz=False, vox_every=100):
         wp.launch(update_materials,
                 dim=len(self.model.tet_materials),
                 inputs=[self.log_K_warp, self.v,
                         self.tet_block_ids],
                 outputs=[self.model.tet_materials])
-        
+
+        s_curr = self.state_a
+        s_next = self.state_b
+
+        self.saved_particle_q = []
+        self.saved_body_q = []
+
+        if save_for_viz:
+            self.saved_particle_q.append(s_curr.particle_q.numpy().copy())
+            if self.has_object:
+                self.saved_body_q.append(s_curr.body_q.numpy().copy())
 
         # MW_ADDED, for enclosed volume, one-time rim calibration from q0
         if (self.voxvol is not None) and (not self.no_cloth) and self.has_object and (not self._vox_calibrated):
-            q0 = self.states[0].particle_q.numpy()
+            q0 = s_curr.particle_q.numpy()
             if q0.ndim == 3:
                 q0 = q0[0]
             self.voxvol.set_open_rims(q0)
 
             self._vox_calibrated = True
 
-        # NEW: voxel volume at t0 (initial state)
+        # voxel volume at initial state t0
         if (self.voxvol is not None) and (not self.no_cloth) and self.has_object:
-            q0 = self.states[0].particle_q.numpy()
+            q0 = s_curr.particle_q.numpy()
             if q0.ndim == 3:
                 q0 = q0[0]
             vol0, dbg0 = self.voxvol.compute(q0, return_points=False)
@@ -314,33 +328,34 @@ class FEMTendon:
                     f"shape={dbg0.get('shape', None)} enclosed_vox={dbg0.get('enclosed_voxels', None)}"
                 )
 
-        # compute volume every N frames
-        vox_every = 100 # compute volume every 10 frames
+        # vox_every = 100 # compute volume every 100 frames
         vox_every = max(1, vox_every)
 
         for frame in range(self.num_frames):
 
             for i in range(self.sim_substeps):
-                index = i + frame * self.sim_substeps
-                self.states[index].clear_forces()
+                s_curr.clear_forces()
                 self.tendon_holder.reset()
                 if i % 1 == 0: # default was % 20, (computing collisions every 20 substeps)
-                    wp.sim.collide(self.model, self.states[index])
+                    wp.sim.collide(self.model, s_curr)
                 
                 self.control.update_target_vel(frame)
 
                 force = self.tendon_forces
 
-                self.tendon_holder.apply_force(force, self.states[index].particle_q, self.success_flag)
-                self.integrator.simulate(self.model, self.states[index], self.states[index+1], self.sim_dt, self.control)
+                self.tendon_holder.apply_force(force, s_curr.particle_q, self.success_flag)
+                self.integrator.simulate(self.model, s_curr, s_next, self.sim_dt, self.control)
 
-                self.object_body_f = self.states[index].body_f
+                self.object_body_f = s_curr.body_f
 
-            if frame == 0 or frame % (self.num_frames / 5) == 0 or frame == (self.num_frames):
+                # ping-pong swap
+                s_curr, s_next = s_next, s_curr
+
+            if frame == 0 or frame % max(1, self.num_frames // 5) == 0 or frame == (self.num_frames - 1):
                 print(f"frame {frame} / {self.num_frames}: body_f:", self.object_body_f.numpy().flatten())
 
             # MW_ADDED, for enclosed volume
-            s_end = self.states[(frame + 1) * self.sim_substeps] # after substeps, use state at end of frame
+            s_end = s_curr # after substeps, current state is the end-of-frame state
 
             is_last_frame = (frame == self.num_frames - 1)
             do_vol = ((frame % vox_every) == 0) or is_last_frame
@@ -367,10 +382,26 @@ class FEMTendon:
                     self.last_voxel_debug = dbg
                     self._last_voxel_q = q_np   # optional, for rim range prints
 
+            # save sparse CPU snapshots for quick viz
+            if save_for_viz and (((frame + 1) % save_stride) == 0 or is_last_frame):
+                self.saved_particle_q.append(s_curr.particle_q.numpy().copy())
+                if self.has_object:
+                    self.saved_body_q.append(s_curr.body_q.numpy().copy())
 
-        self.object_q = self.states[-1].body_q
-        self.object_body_f = self.states[-1].body_f # body force from last state after integration
+            # render on the fly, doesnt need gpu states anymore
+            if self.renderer is not None:
+                self.renderer.begin_frame(self.render_time)
+                self.renderer.render(
+                    s_curr,
+                    np.array(self.builder.waypoint_ids).flatten(),
+                    force_scale=0.1)
+                self.renderer.end_frame()
+                self.render_time += self.frame_dt
 
+        self.state_a, self.state_b = s_curr, s_next
+
+        self.object_q = s_curr.body_q
+        self.object_body_f = s_curr.body_f # body force from last state after integration
 
         # MW_ADDED, for enclosed volume, save log and print
         if self.voxvol is not None:
@@ -396,22 +427,10 @@ class FEMTendon:
 
             if self.verbose and (self.last_voxel_debug is not None):
                 plot_last_frame_with_voxels(self, self.last_voxel_debug)
-
     
 
     def render(self):
-        if self.renderer is None:
-            return
-
-        with wp.ScopedTimer("render", print=False):
-            for i in range(self.num_frames + 1):
-                self.renderer.begin_frame(self.render_time)
-                self.renderer.render(
-                    self.states[i * self.sim_substeps], 
-                    np.array(self.builder.waypoint_ids).flatten(), 
-                    force_scale=0.1)
-                self.renderer.end_frame()
-                self.render_time += self.frame_dt
+        return
 
 
     def optimize_forces_lbfgs(self, iterations=10, learning_rate=1.0, opt_frames=10):
@@ -426,6 +445,10 @@ class FEMTendon:
 
         # This optimisation path assumes CUDA because FEMForceOptimization.run uses torch tensors on cuda.
         torch_device = "cuda"
+
+        # create a SHORT temporary state buffer just for optimization
+        opt_state_count = self.sim_substeps * opt_frames + 1
+        opt_states = [self.model.state(requires_grad=self.requires_grad) for _ in range(opt_state_count)]
 
         # Initialise latents from current forces via inverse sigmoid
         start_vals = self.tendon_forces.numpy() / max_force
@@ -458,7 +481,7 @@ class FEMTendon:
             loss_base = FEMForceOptimization.run(
                 torch.tensor(forces_np, device=torch_device),
                 self.model,
-                self.states,
+                opt_states,
                 self.integrator,
                 self.sim_dt,
                 self.control,
@@ -485,7 +508,7 @@ class FEMTendon:
                 loss_new = FEMForceOptimization.run(
                     torch.tensor(test_forces_np, device=torch_device),
                     self.model,
-                    self.states,
+                    opt_states,
                     self.integrator,
                     self.sim_dt,
                     self.control,
@@ -808,7 +831,7 @@ class VolumeLogger:
             "substep": int(substep),
             "vol_vox": float(vol),
         }
-        # optional debug columns (nice for sanity checks)
+        # optional debugs
         if dbg is not None:
             row.update({
                 "enclosed_voxels": int(dbg.get("enclosed_voxels", -1)),
@@ -993,10 +1016,14 @@ if __name__ == "__main__":
                 print("No optimization run (history is None).")
 
 
-        tendon.forward()
-        if args.is_render:
-            tendon.render()
+        tendon.forward(
+            save_stride=args.quick_viz_stride,
+            save_for_viz=args.quick_viz,
+        )
+
+        if args.is_render and tendon.renderer is not None:
             tendon.renderer.save()
+
         # ADDED
         if args.quick_viz:
             quick_visualize(
