@@ -1,6 +1,6 @@
 # plot_volume_across_finger_counts.py
-
-# run like: python plot_volume_across_finger_counts.py sweep_results_volume_across_finger_counts/experiment_data_voxvol.csv
+#
+# run like: python plot_volume_across_finger_counts.py logs/sweep_vol_fingers_YYYYMMDD_HHMMSS/summary.csv
 
 import os
 import argparse
@@ -52,29 +52,37 @@ def save(fig, out_dir, stem):
 
 
 def read_data(csv_path):
-    df = pd.read_csv(csv_path, quotechar='"')
+    df = pd.read_csv(csv_path)
 
-    if "Status" in df.columns:
-        df["Status"] = df["Status"].fillna("").astype(str).str.strip()
-        df = df[df["Status"] == "ok"].copy()
+    if "status" in df.columns:
+        df["status"] = df["status"].fillna("").astype(str).str.strip()
+        df = df[df["status"] == "ok"].copy()
 
-    for col in [
-        "Num_Fingers",
-        "Radius_Mean",
-        "Final_Loss",
-        "Avg_Force",
-        "Init_VoxVol",
-        "Final_VoxVol",
-        "Delta_VoxVol",
-    ]:
+    numeric_cols = [
+        "finger_num",
+        "seed",
+        "radius_mean",
+        "final_loss",
+        "avg_force",
+        "init_vol_vox",
+        "final_vol_vox",
+        "delta_vol_vox",
+        "reduction_pct",
+        "final_over_init",
+        "runtime_s",
+    ]
+    for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df = df.dropna(subset=["Object", "Num_Fingers", "Init_VoxVol", "Final_VoxVol"]).copy()
-    df["Num_Fingers"] = df["Num_Fingers"].astype(int)
+    df = df.dropna(subset=["object", "finger_num", "init_vol_vox", "final_vol_vox"]).copy()
+    df["finger_num"] = df["finger_num"].astype(int)
 
-    df["Reduction_pct"] = 100.0 * (df["Init_VoxVol"] - df["Final_VoxVol"]) / df["Init_VoxVol"]
-    df["Final_over_Init"] = df["Final_VoxVol"] / df["Init_VoxVol"]
+    if "reduction_pct" not in df.columns or df["reduction_pct"].isna().all():
+        df["reduction_pct"] = 100.0 * (df["init_vol_vox"] - df["final_vol_vox"]) / df["init_vol_vox"]
+
+    if "final_over_init" not in df.columns or df["final_over_init"].isna().all():
+        df["final_over_init"] = df["final_vol_vox"] / df["init_vol_vox"]
 
     return df
 
@@ -82,14 +90,18 @@ def read_data(csv_path):
 def aggregate_by_finger(df):
     rows = []
 
-    for nf, g in df.groupby("Num_Fingers"):
-        init_vals = g["Init_VoxVol"].dropna().to_numpy()
-        final_vals = g["Final_VoxVol"].dropna().to_numpy()
-        red_vals = g["Reduction_pct"].dropna().to_numpy()
+    for nf, g in df.groupby("finger_num"):
+        init_vals = g["init_vol_vox"].dropna().to_numpy()
+        final_vals = g["final_vol_vox"].dropna().to_numpy()
+        red_vals = g["reduction_pct"].dropna().to_numpy()
+        ratio_vals = g["final_over_init"].dropna().to_numpy()
+        radius_vals = g["radius_mean"].dropna().to_numpy()
+        runtime_vals = g["runtime_s"].dropna().to_numpy()
 
         row = {
-            "Num_Fingers": int(nf),
+            "finger_num": int(nf),
             "count": int(len(g)),
+
             "init_mean": np.mean(init_vals),
             "init_std": np.std(init_vals, ddof=1) if len(init_vals) > 1 else np.nan,
             "init_median": np.median(init_vals),
@@ -107,14 +119,29 @@ def aggregate_by_finger(df):
             "reduction_median": np.median(red_vals),
             "reduction_q25": np.percentile(red_vals, 25),
             "reduction_q75": np.percentile(red_vals, 75),
+
+            "ratio_mean": np.mean(ratio_vals),
+            "ratio_std": np.std(ratio_vals, ddof=1) if len(ratio_vals) > 1 else np.nan,
+            "ratio_median": np.median(ratio_vals),
+            "ratio_q25": np.percentile(ratio_vals, 25),
+            "ratio_q75": np.percentile(ratio_vals, 75),
+
+            "radius_mean_mean": np.mean(radius_vals) if len(radius_vals) > 0 else np.nan,
+            "radius_mean_median": np.median(radius_vals) if len(radius_vals) > 0 else np.nan,
+
+            "runtime_mean": np.mean(runtime_vals) if len(runtime_vals) > 0 else np.nan,
+            "runtime_median": np.median(runtime_vals) if len(runtime_vals) > 0 else np.nan,
         }
         rows.append(row)
 
-    summary = pd.DataFrame(rows).sort_values("Num_Fingers").reset_index(drop=True)
+    summary = pd.DataFrame(rows).sort_values("finger_num").reset_index(drop=True)
 
-    summary["init_gain_vs_prev_pct"] = np.nan
-    summary["final_gain_vs_prev_pct"] = np.nan
-    summary["reduction_gain_vs_prev_pct"] = np.nan
+    summary["init_gain_abs_vs_prev"] = np.nan
+    summary["init_gain_pct_vs_prev"] = np.nan
+    summary["final_gain_abs_vs_prev"] = np.nan
+    summary["final_gain_pct_vs_prev"] = np.nan
+    summary["reduction_gain_abs_vs_prev"] = np.nan
+    summary["reduction_gain_pct_vs_prev"] = np.nan
 
     for i in range(1, len(summary)):
         prev_init = summary.loc[i - 1, "init_median"]
@@ -126,19 +153,29 @@ def aggregate_by_finger(df):
         prev_red = summary.loc[i - 1, "reduction_median"]
         curr_red = summary.loc[i, "reduction_median"]
 
+        summary.loc[i, "init_gain_abs_vs_prev"] = prev_init - curr_init
+        summary.loc[i, "final_gain_abs_vs_prev"] = prev_final - curr_final
+        summary.loc[i, "reduction_gain_abs_vs_prev"] = curr_red - prev_red
+
         if np.isfinite(prev_init) and abs(prev_init) > 1e-12:
-            summary.loc[i, "init_gain_vs_prev_pct"] = 100.0 * (prev_init - curr_init) / prev_init
+            summary.loc[i, "init_gain_pct_vs_prev"] = 100.0 * (prev_init - curr_init) / prev_init
 
         if np.isfinite(prev_final) and abs(prev_final) > 1e-12:
-            summary.loc[i, "final_gain_vs_prev_pct"] = 100.0 * (prev_final - curr_final) / prev_final
+            summary.loc[i, "final_gain_pct_vs_prev"] = 100.0 * (prev_final - curr_final) / prev_final
 
         if np.isfinite(prev_red) and abs(prev_red) > 1e-12:
-            summary.loc[i, "reduction_gain_vs_prev_pct"] = 100.0 * (curr_red - prev_red) / prev_red
+            summary.loc[i, "reduction_gain_pct_vs_prev"] = 100.0 * (curr_red - prev_red) / prev_red
 
+    best_init = summary["init_median"].min()
     best_final = summary["final_median"].min()
-    summary["within_5pct_of_best_final"] = summary["final_median"] <= 1.05 * best_final
-
     best_reduction = summary["reduction_median"].max()
+
+    summary["init_distance_to_best_pct"] = 100.0 * (summary["init_median"] - best_init) / best_init
+    summary["final_distance_to_best_pct"] = 100.0 * (summary["final_median"] - best_final) / best_final
+    summary["reduction_distance_to_best_pct"] = 100.0 * (best_reduction - summary["reduction_median"]) / best_reduction
+
+    summary["within_5pct_of_best_init"] = summary["init_median"] <= 1.05 * best_init
+    summary["within_5pct_of_best_final"] = summary["final_median"] <= 1.05 * best_final
     summary["within_5pct_of_best_reduction"] = summary["reduction_median"] >= 0.95 * best_reduction
 
     return summary
@@ -146,25 +183,29 @@ def aggregate_by_finger(df):
 
 def per_object_best(df):
     rows = []
-    for obj, g in df.groupby("Object"):
-        g = g.sort_values("Num_Fingers").copy()
 
-        i_best_final = g["Final_VoxVol"].idxmin()
-        i_best_reduction = g["Reduction_pct"].idxmax()
+    for obj, g in df.groupby("object"):
+        g = g.sort_values("finger_num").copy()
+
+        i_best_init = g["init_vol_vox"].idxmin()
+        i_best_final = g["final_vol_vox"].idxmin()
+        i_best_reduction = g["reduction_pct"].idxmax()
 
         rows.append({
-            "Object": obj,
-            "Best_final_finger_count": int(g.loc[i_best_final, "Num_Fingers"]),
-            "Best_final_voxvol": float(g.loc[i_best_final, "Final_VoxVol"]),
-            "Best_reduction_finger_count": int(g.loc[i_best_reduction, "Num_Fingers"]),
-            "Best_reduction_pct": float(g.loc[i_best_reduction, "Reduction_pct"]),
+            "object": obj,
+            "best_init_finger_count": int(g.loc[i_best_init, "finger_num"]),
+            "best_init_voxvol": float(g.loc[i_best_init, "init_vol_vox"]),
+            "best_final_finger_count": int(g.loc[i_best_final, "finger_num"]),
+            "best_final_voxvol": float(g.loc[i_best_final, "final_vol_vox"]),
+            "best_reduction_finger_count": int(g.loc[i_best_reduction, "finger_num"]),
+            "best_reduction_pct": float(g.loc[i_best_reduction, "reduction_pct"]),
         })
 
-    return pd.DataFrame(rows).sort_values("Object")
+    return pd.DataFrame(rows).sort_values("object")
 
 
 def plot_band(summary, y_med, y_q25, y_q75, ylabel, out_dir, stem):
-    x = summary["Num_Fingers"].to_numpy()
+    x = summary["finger_num"].to_numpy()
 
     fig, ax = plt.subplots(figsize=(4.8, 4.15))
 
@@ -200,9 +241,10 @@ def plot_band(summary, y_med, y_q25, y_q75, ylabel, out_dir, stem):
         Line2D([0], [0], color=line_color, lw=2.3, label="Median"),
         Patch(facecolor=band_color, edgecolor="none", alpha=0.45, label="Interquartile range"),
     ]
-    ax.legend(handles=handles, frameon=False, loc="upper right")
+    ax.legend(handles=handles, frameon=False, loc="best")
 
     save(fig, out_dir, stem)
+
 
 def plot_final_spaghetti(df, summary, out_dir):
     fig, ax = plt.subplots(figsize=(FULL_W, 4.0))
@@ -210,11 +252,11 @@ def plot_final_spaghetti(df, summary, out_dir):
     indiv_color = "#D0D5DB"
     med_color = "#1F4E79"
 
-    for _, g in df.groupby("Object", sort=True):
-        g = g.sort_values("Num_Fingers")
+    for _, g in df.groupby("object", sort=True):
+        g = g.sort_values("finger_num")
         ax.plot(
-            g["Num_Fingers"],
-            g["Final_VoxVol"],
+            g["finger_num"],
+            g["final_vol_vox"],
             color=indiv_color,
             linewidth=1.0,
             alpha=0.9,
@@ -222,7 +264,7 @@ def plot_final_spaghetti(df, summary, out_dir):
         )
 
     ax.plot(
-        summary["Num_Fingers"],
+        summary["finger_num"],
         summary["final_median"],
         color=med_color,
         linewidth=2.2,
@@ -233,7 +275,7 @@ def plot_final_spaghetti(df, summary, out_dir):
 
     ax.set_xlabel("Number of fingers")
     ax.set_ylabel("Final enclosed cavity volume")
-    ax.set_xticks(summary["Num_Fingers"])
+    ax.set_xticks(summary["finger_num"])
     ax.grid(axis="y", color="#E6E6E6", linewidth=0.8)
 
     handles = [
@@ -253,7 +295,7 @@ def plot_incremental_gain(summary, col, ylabel, out_dir, stem):
     fig, ax = plt.subplots(figsize=(HALF_W + 1.1, 3.7))
 
     ax.bar(
-        d["Num_Fingers"].astype(str),
+        d["finger_num"].astype(str),
         d[col],
         color="#4C78A8",
         width=0.72,
@@ -267,16 +309,37 @@ def plot_incremental_gain(summary, col, ylabel, out_dir, stem):
     save(fig, out_dir, stem)
 
 
-def plot_best_count_bar(best_df, out_dir):
-    vals, counts = np.unique(best_df["Best_final_finger_count"].to_numpy(dtype=int), return_counts=True)
+def plot_distance_to_best(summary, col, ylabel, out_dir, stem):
+    fig, ax = plt.subplots(figsize=(HALF_W + 1.1, 3.7))
+
+    ax.plot(
+        summary["finger_num"],
+        summary[col],
+        color="#1F4E79",
+        marker="o",
+        linewidth=2.2,
+        markersize=4.8,
+    )
+
+    ax.axhline(5.0, color="#888888", linewidth=0.9, linestyle="--")
+    ax.set_xlabel("Number of fingers")
+    ax.set_ylabel(ylabel)
+    ax.set_xticks(summary["finger_num"])
+    ax.grid(axis="y", color="#E6E6E6", linewidth=0.8)
+
+    save(fig, out_dir, stem)
+
+
+def plot_best_count_bar(best_df, col, xlabel, out_dir, stem):
+    vals, counts = np.unique(best_df[col].to_numpy(dtype=int), return_counts=True)
 
     fig, ax = plt.subplots(figsize=(HALF_W + 0.9, 3.6))
     ax.bar(vals.astype(str), counts, color="#4C78A8", width=0.72)
-    ax.set_xlabel("Finger count")
+    ax.set_xlabel(xlabel)
     ax.set_ylabel("Number of corals")
     ax.grid(axis="y", color="#E6E6E6", linewidth=0.8)
 
-    save(fig, out_dir, "best_final_count_per_object")
+    save(fig, out_dir, stem)
 
 
 def main():
@@ -318,26 +381,6 @@ def main():
 
     plot_band(
         summary,
-        y_med="init_median",
-        y_q25="init_q25",
-        y_q75="init_q75",
-        ylabel="Initial enclosed cavity volume",
-        out_dir=out_dir,
-        stem="initial_volume_median_iqr",
-    )
-
-    plot_band(
-        summary,
-        y_med="final_median",
-        y_q25="final_q25",
-        y_q75="final_q75",
-        ylabel="Final enclosed cavity volume",
-        out_dir=out_dir,
-        stem="final_volume_median_iqr",
-    )
-
-    plot_band(
-        summary,
         y_med="reduction_median",
         y_q25="reduction_q25",
         y_q75="reduction_q75",
@@ -346,17 +389,65 @@ def main():
         stem="reduction_percent_median_iqr",
     )
 
+    plot_band(
+        summary,
+        y_med="radius_mean_median",
+        y_q25="radius_mean_median",
+        y_q75="radius_mean_median",
+        ylabel="Median initialized radius",
+        out_dir=out_dir,
+        stem="radius_mean_median",
+    )
+
     plot_final_spaghetti(df, summary, out_dir)
 
     plot_incremental_gain(
         summary,
-        col="final_gain_vs_prev_pct",
-        ylabel="Median final-volume improvement\nvs previous finger count (%)",
+        col="init_gain_pct_vs_prev",
+        ylabel="Initial-volume improvement\nvs previous finger count (%)",
+        out_dir=out_dir,
+        stem="initial_volume_incremental_gain",
+    )
+
+    plot_incremental_gain(
+        summary,
+        col="final_gain_pct_vs_prev",
+        ylabel="Final-volume improvement\nvs previous finger count (%)",
         out_dir=out_dir,
         stem="final_volume_incremental_gain",
     )
 
-    plot_best_count_bar(best_df, out_dir)
+    plot_incremental_gain(
+        summary,
+        col="reduction_gain_pct_vs_prev",
+        ylabel="Reduction improvement\nvs previous finger count (%)",
+        out_dir=out_dir,
+        stem="reduction_percent_incremental_gain",
+    )
+
+    plot_distance_to_best(
+        summary,
+        col="final_distance_to_best_pct",
+        ylabel="Distance to best final volume (%)",
+        out_dir=out_dir,
+        stem="final_volume_distance_to_best",
+    )
+
+    plot_best_count_bar(
+        best_df,
+        col="best_final_finger_count",
+        xlabel="Best final finger count",
+        out_dir=out_dir,
+        stem="best_final_count_per_object",
+    )
+
+    plot_best_count_bar(
+        best_df,
+        col="best_init_finger_count",
+        xlabel="Best initial finger count",
+        out_dir=out_dir,
+        stem="best_init_count_per_object",
+    )
 
     print(f"Saved plots to: {out_dir}")
     print("Saved tables:")

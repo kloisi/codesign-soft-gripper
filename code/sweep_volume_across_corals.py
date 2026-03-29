@@ -1,10 +1,13 @@
 # sweep_volume_across_corals.py
 #
 # sweep for enclosure-volume evaluation across coral objects.
+
+# run like: python sweep_volume_across_corals.py
+
 # Saves:
-#   - summary.csv    : one row per coral
-#   - timeseries.csv : enclosed volume over time for all corals
-#   - aggregate_stats.csv : mean/std/median/IQR for report table
+# - summary.csv : one row per coral
+# - timeseries.csv : enclosed volume over time for all corals
+# - aggregate_stats.csv : mean/std/median/IQR for report table
 
 import os
 import gc
@@ -332,7 +335,7 @@ def main():
     pd.DataFrame(timeseries_rows).to_csv(os.path.join(out_dir, "timeseries.csv"), index=False)
     aggregate_df.to_csv(os.path.join(out_dir, "aggregate_stats.csv"), index=False)
 
-    # useful clean per-object table for thesis appendix or manual copy
+    # useful clean per-object table
     per_object_df = ok[[
         "object",
         "init_vol_vox_m3",
