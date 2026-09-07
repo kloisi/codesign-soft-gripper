@@ -122,8 +122,8 @@ class FEMTendon:
             obj_loader=self.obj_loader,
             finger_transform=self.finger_transform,
             is_triangle=True,
-            add_connecting_cloth=True,
-            add_drop_cloth=False, # add cloth for dropping test
+            add_connecting_cloth=False,
+            add_drop_cloth=True, # add cloth for dropping test
             )
         self.model = self.builder.model
         self.control = self.model.control(requires_grad=self.requires_grad)
@@ -246,7 +246,7 @@ class FEMTendon:
                 index = i + frame * self.sim_substeps
                 self.states[index].clear_forces()
                 self.tendon_holder.reset()
-                if i % 1 == 0: # default was % 10, (computing collisions every 10 substeps)
+                if i % 10 == 0: # default was % 10, (computing collisions every 10 substeps)
                     wp.sim.collide(self.model, self.states[index])
                 
                 self.control.update_target_vel(frame)
@@ -411,7 +411,7 @@ if __name__ == "__main__":
         default="femtendon_sim.usd",
         help="Path to the output USD file.",
     )
-    parser.add_argument("--num_frames", type=int, default=100, help="Total number of frames per training iteration.") # changed number of frames to give enough time for the cloth to fall and deform
+    parser.add_argument("--num_frames", type=int, default=3900, help="Total number of frames per training iteration.") # changed number of frames to give enough time for the cloth to fall and deform
     parser.add_argument("--train_iters", type=int, default=1, help="Total number of training iterations.")
     parser.add_argument("--object_name", type=str, default="006_mustard_bottle", help="Name of the object to load.")
     parser.add_argument("--object_density", type=float, default=2e0, help="Density of the object.")
@@ -424,7 +424,7 @@ if __name__ == "__main__":
     parser.add_argument("--render", action="store_true", help="Render the simulation.")
 
     # ADDED
-    parser.add_argument("--fps", type=int, default=5000)
+    parser.add_argument("--fps", type=int, default=4000)
     parser.add_argument("--sim_substeps", type=int, default=100)
 
     # experiment related setup

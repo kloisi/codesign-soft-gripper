@@ -1,9 +1,12 @@
+# init_pose.py
+
 import os
 import numpy as np
 import torch
 import math
 import csv
 import matplotlib.pyplot as plt
+import pandas as pd
 
 import warp as wp
 import utils
@@ -102,6 +105,9 @@ class ForwardKinematics(torch.autograd.Function):
             # Copy FK poses to state_out so the rest of the code stays unchanged
             ctx.state_out.body_q = wp.clone(ctx.state_in.body_q)
 
+            finger_dist_param = 1e-1
+            finger_pen_param = 1e3
+
             for i in range(len(curr_finger_mesh)):
                 wp.launch(utils.transform_points_out,
                         dim=len(ctx.curr_finger_mesh[i]),
@@ -120,8 +126,8 @@ class ForwardKinematics(torch.autograd.Function):
                                 ctx.curr_finger_mesh[i],
                                 # ctx.model.rigid_contact_margin*1.0,
                                 ctx.model.object_contact_margin*1.0,
-                                1e-1,
-                                1e3, 0],
+                                finger_dist_param, finger_pen_param,
+                                0],
                         outputs=[ctx.finger_dis])
 
             
@@ -183,6 +189,7 @@ class ForwardKinematics(torch.autograd.Function):
         utils.remove_nan(trans2d_grad)
         trans9d_grad.clamp_(-max_grad_trans, max_grad_trans)
         trans2d_grad.clamp_(-max_grad_trans, max_grad_trans)
+        #trans2d_grad.zero_()
         trans9d_grad[0].zero_()
         #trans9d_grad[1].zero_()
         trans9d_grad[2].zero_()
@@ -218,6 +225,9 @@ class InitializeFingers:
                  cloth_k=16,
                  cloth_alphas=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9),
                  cloth_margin_mult=1.0,
+                 fixed_radius=None,
+                 fixed_height_y=None,          # absolute world y, if you want
+                 fixed_height_offset=-0.28,      # relative to the initial y
                  ):
         self.pose_id = pose_id
         self.verbose = verbose
@@ -230,6 +240,7 @@ class InitializeFingers:
         self.num_envs = num_envs
         self.is_triangle = is_triangle
         self.add_random = add_random
+        self.fixed_radius = fixed_radius
 
         self.sim_substeps = 1
         self.sim_dt = self.frame_dt / self.sim_substeps
@@ -275,12 +286,15 @@ class InitializeFingers:
         # for arbitrary number of points (e.g. one value per finger)
         self.transform_2d_wp = wp.zeros(self.finger_num, dtype=wp.float32, requires_grad=True)
 
-        self.log = False
+        self.log = True
         # --- History Storage ---
         self.loss_history = []
         self.radius_history = []
         self.iter_history = []
 
+        # NEW: store loss decomposition
+        self.finger_loss_history = []
+        self.cloth_loss_history = []
 
         wp.launch(utils.transform_to11d, dim=1,
                   inputs=[self.joint_q],
@@ -295,9 +309,12 @@ class InitializeFingers:
         self.transform_9d = wp.to_torch(self.transform_9d_wp, requires_grad=True)
         self.transform_2d = wp.to_torch(self.transform_2d_wp, requires_grad=True)
 
+        # height knob
+        self._y0 = float(self.transform_9d[1].item())
+        self._y_fixed = float(fixed_height_y) if (fixed_height_y is not None) else (self._y0 + float(fixed_height_offset))
+
         self.optimizer = torch.optim.SGD([
-            {'params': self.transform_9d, 'lr': 1e-1, 'weight_decay': 1e-5},
-            {'params': self.transform_2d, 'lr': 1e-2}, 
+            {'params': self.transform_2d, 'lr': 1e-2},
         ])
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', patience=50, factor=0.05)
 
@@ -312,6 +329,15 @@ class InitializeFingers:
 
         self.use_cuda_graph = wp.get_device().is_cuda
         self.use_cuda_graph = False
+
+    def set_height(self, y):
+        """Set absolute wrist height (world y)."""
+        self._y_fixed = float(y)
+
+    def set_height_offset(self, dy):
+        """Set height relative to the initial y."""
+        self._y_fixed = self._y0 + float(dy)
+
     
     def build_rigid_model(self, object_rot):
         # --- build the soft finger geometry (all fingers) ---
@@ -432,11 +458,18 @@ class InitializeFingers:
 
         # wrist body is free; fingers connect via prismatic joints
         wrist_body = self.builder.add_body(origin=wp.transform_identity())
+        self.wrist_body_idx = wrist_body
         self.builder.add_joint_free(parent=-1, child=wrist_body)
 
         # contact/thickness-based limits (same for all prismatic joints for now)
         limit_low, limit_upp = -6 * finger_THK , 6 * finger_THK # was 6 * finger_THK
         self.limit_low, self.limit_upp = limit_low, limit_upp
+        if self.fixed_radius is not None:
+            needed_range = abs(self.fixed_radius) + 0.1 # Add buffer
+            if needed_range > self.limit_upp:
+                # print(f"[InitPose] Expanding limits from {self.limit_upp:.3f} to {needed_range:.3f} to accommodate fixed radius.")
+                self.limit_upp = needed_range
+                self.limit_low = -needed_range
         self.prismatic_limit = float(limit_upp) # store one number
 
         # add collision shapes for each finger
@@ -532,6 +565,8 @@ class InitializeFingers:
         Sweep a single shared radius value across all fingers.
         span is fraction of limit_upp around the current init value.
         """
+        if self.fixed_radius is not None:
+            return
         with torch.no_grad():
             span=0.6
             num=11
@@ -666,6 +701,18 @@ class InitializeFingers:
         #     sign = 1.0  # or -1.0 for some fingers
         #     finger_init[i] = sign * R0
 
+    def get_current_center_radii(self):
+        body_q = self.state1.body_q.numpy()   # current FK result
+        center = body_q[self.wrist_body_idx, :3]
+
+        radii = []
+        for bid in self.finger_body_idx:
+            p = body_q[bid, :3]
+            r = np.linalg.norm(p[[0, 2]] - center[[0, 2]])  # radius in x-z plane
+            radii.append(r)
+
+        return np.asarray(radii, dtype=float)
+
 
     def load_grasp_pose(self, pose_id):
         self.pose_id = pose_id
@@ -754,6 +801,9 @@ class InitializeFingers:
         self.finger_dis.zero_()
         self.cloth_dis.zero_()
 
+        with torch.no_grad():
+            self.transform_9d[1].fill_(self._y_fixed)
+
         total_dis_torch = ForwardKinematics.apply(
             self.transform_9d, 
             self.transform_2d,
@@ -810,7 +860,7 @@ class InitializeFingers:
                 self.transform_2d.clamp_(self.limit_low, self.limit_upp)
 
             # --- log current radius and loss parameters ---
-            current_radius = self.transform_2d.detach().cpu().numpy().copy()
+            current_radius = self.get_current_center_radii()
             current_loss = self.loss.item()
 
             # --- store history ---
@@ -818,77 +868,175 @@ class InitializeFingers:
             self.radius_history.append(current_radius)
             self.iter_history.append(iter)
 
+            # NEW: loss breakdown history
+            self.finger_loss_history.append(float(self.finger_loss.item()))
+            self.cloth_loss_history.append(float(self.cloth_loss.item()))
+
             # log to console
-            if iter % 10 == 0:
+            if iter % 100 == 0:
                 r = current_radius
                 lr9  = self.optimizer.param_groups[0]["lr"]
-                lr2  = self.optimizer.param_groups[1]["lr"]
+                #lr2  = self.optimizer.param_groups[1]["lr"]
                 g2   = self.transform_2d.grad.detach().cpu().numpy().copy() if self.transform_2d.grad is not None else None
-                print(
-                    f"[iter {iter}] loss={self.loss.item():.4g}"
-                    f"  finger_loss={self.finger_loss.item():.4g} cloth_loss(norm)={self.cloth_loss.item():.4g}"
-                    f"  radius params (transform_2d): {current_radius}"
-                    f"  lr2={lr2:.3e}, lr9={lr9:.3e}, grad2_norm={np.linalg.norm(g2) if g2 is not None else None}"
-                )
+                # print(
+                #     f"[iter {iter}] loss={self.loss.item():.4g}"
+                #     f"  finger_loss={self.finger_loss.item():.4g} cloth_loss(norm)={self.cloth_loss.item():.4g}"
+                #     f"  radius params (transform_2d): {current_radius}"
+                #     f"  lr2={lr2:.3e}, lr9={lr9:.3e}, grad2_norm={np.linalg.norm(g2) if g2 is not None else None}"
+                # )
+                print(f"[iter {iter}]" f"radius = {current_radius}")
 
         self.state0, self.state1 = self.state1, self.state0
         self.optimizer.zero_grad()
-    
-    def export_and_plot(self, output_dir="opt_results", threshold=None):
-        """Saves optimization history to CSV and plots graphs."""
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-        
-        # 1. Save to CSV
-        csv_filename = os.path.join(output_dir, f"log_{self.ycb_object_name}_pose{self.pose_id}.csv")
-        print(f"Saving CSV to {csv_filename}...")
-        
-        with open(csv_filename, mode='w', newline='') as file:
-            writer = csv.writer(file)
-            # Header: Iteration, Loss, Finger_0, Finger_1, ...
-            headers = ["Iteration", "Loss"] + [f"Finger_{i}_Radius" for i in range(self.finger_num)]
-            writer.writerow(headers)
-            
-            for i in range(len(self.iter_history)):
-                row = [self.iter_history[i], self.loss_history[i]]
-                row.extend(self.radius_history[i]) # Add all finger radii
-                writer.writerow(row)
 
-        # 2. Plot Loss vs Iteration
-        plt.figure(figsize=(10, 5))
-        plt.plot(self.iter_history, self.loss_history, label='Loss', color='red', linewidth=1.5)
 
-        # --- NEW: Add Threshold Line ---
-        if threshold is not None and False:
-            plt.axhline(y=threshold, color='green', linestyle='--', label=f'Convergence Threshold ({threshold})')
-        # Use Log Scale so we can actually see 1e-5
-        plt.yscale('log')
-        plt.xlabel('Iterations')
-        plt.ylabel('Loss (Log Scale)')
-        plt.title(f'Optimization Loss - {self.ycb_object_name}')
-        plt.grid(True, which="both", ls="-", alpha=0.2) # finer grid for log scale
-        plt.legend()
-        plt.savefig(os.path.join(output_dir, f"plot_loss_{self.ycb_object_name}.png"))
-        plt.close()
+    FULL_W = 6.8
+    HALF_W = 3.3
+    DPI = 300
 
-        # 3. Plot Radius vs Iteration
-        plt.figure(figsize=(10, 5))
-        # Convert list of arrays to a 2D array for easier plotting [iters, fingers]
-        radii_array = np.array(self.radius_history) 
-        
-        for i in range(self.finger_num):
-            plt.plot(self.iter_history, radii_array[:, i], label=f'Finger {i}')
-            
-        plt.xlabel('Iterations')
-        plt.ylabel('Radius (meters)')
-        plt.title(f'Finger Radius Optimization - {self.ycb_object_name}')
-        plt.grid(True)
-        plt.legend()
-        plt.savefig(os.path.join(output_dir, f"plot_radius_{self.ycb_object_name}.png"))
-        plt.close()
-        
-        print(f"Plots saved to {output_dir}")
+    @staticmethod
+    def setup_plot_style():
+        plt.rcParams.update({
+            "figure.facecolor": "white",
+            "axes.facecolor": "white",
+            "savefig.facecolor": "white",
+            "savefig.bbox": "tight",
+            "font.family": "serif",
+            "font.serif": [
+                "Computer Modern Roman",
+                "CMU Serif",
+                "Latin Modern Roman",
+                "DejaVu Serif",
+            ],
+            "mathtext.fontset": "cm",
+            "axes.unicode_minus": False,
 
+            "font.size": 9,
+            "axes.labelsize": 10,
+            "axes.titlesize": 10,
+            "xtick.labelsize": 8.5,
+            "ytick.labelsize": 8.5,
+            "legend.fontsize": 8,
+
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "axes.grid": False,
+            "lines.linewidth": 1.8,
+        })
+
+    @staticmethod
+    def save_plot(fig, path, dpi=400):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fig.savefig(path, dpi=dpi, bbox_inches="tight", pad_inches=0.02)
+        plt.close(fig)
+
+    def export_and_plot(self, output_dir="plots_optim", threshold=None):
+        self.setup_plot_style()
+
+        base_dir = os.path.dirname(os.path.realpath(__file__))
+        out_dir = os.path.abspath(os.path.join(base_dir, "../code/logs", output_dir))
+        os.makedirs(out_dir, exist_ok=True)
+
+        stem = f"{self.ycb_object_name}_pose{self.pose_id}"
+
+        iters = np.asarray(self.iter_history, dtype=int)
+        total_loss = np.asarray(self.loss_history, dtype=float)
+        finger_loss = np.asarray(self.finger_loss_history, dtype=float)
+        cloth_loss = np.asarray(self.cloth_loss_history, dtype=float)
+        radii = np.asarray(self.radius_history, dtype=float)
+
+        csv_path = os.path.join(out_dir, f"log_{stem}.csv")
+
+        data = {
+            "iteration": iters,
+            "loss": total_loss,
+            "finger_loss": finger_loss,
+            "cloth_loss": cloth_loss,
+        }
+
+        if radii.ndim == 2 and radii.shape[1] == self.finger_num:
+            for i in range(self.finger_num):
+                data[f"finger_{i}_radius"] = radii[:, i]
+
+        pd.DataFrame(data).to_csv(csv_path, index=False)
+
+        eps = 1e-12
+
+        # Loss plot
+        fig, ax = plt.subplots(figsize=(self.HALF_W, 2.9))
+
+        ax.plot(
+            iters,
+            np.maximum(total_loss, eps),
+            label="Total",
+            linestyle="--",
+            linewidth=2.0,
+            zorder=3,
+        )
+        ax.plot(
+            iters,
+            np.maximum(finger_loss, eps),
+            label="Finger",
+            linewidth=1.8,
+            zorder=2,
+        )
+        ax.plot(
+            iters,
+            np.maximum(cloth_loss, eps),
+            label="Cloth",
+            linewidth=1.8,
+            zorder=1,
+        )
+
+        ax.set_yscale("log")
+        ax.set_xlabel("Iteration")
+        ax.set_ylabel("Loss")
+        ax.grid(axis="y", color="#E6E6E6", linewidth=0.8)
+        ax.margins(x=0.02)
+
+        ax.legend(
+            frameon=False,
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.20),
+            ncol=3,
+            handlelength=1.8,
+            handletextpad=0.5,
+            columnspacing=1.0,
+            borderaxespad=0.0,
+        )
+
+        fig.subplots_adjust(left=0.18, right=0.98, top=0.98, bottom=0.28)
+
+        self.save_plot(fig, os.path.join(out_dir, f"plot_loss_breakdown_{stem}.png"), dpi=self.DPI)
+
+        # Radius plot
+        fig, ax = plt.subplots(figsize=(self.HALF_W, 2.9))
+
+        if radii.ndim == 2 and radii.shape[1] == self.finger_num:
+            for i in range(self.finger_num):
+                ax.plot(iters, radii[:, i], label=f"F{i + 1}")
+
+        ax.set_xlabel("Iteration")
+        ax.set_ylabel("Radius from center")
+        ax.grid(axis="y", color="#E6E6E6", linewidth=0.8)
+        ax.margins(x=0.02)
+
+        ax.legend(
+            frameon=False,
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.22),
+            ncol=3,
+            handlelength=1.6,
+            handletextpad=0.4,
+            columnspacing=0.8,
+            borderaxespad=0.0,
+        )
+
+        fig.subplots_adjust(left=0.18, right=0.98, top=0.98, bottom=0.32)
+        self.save_plot(fig, os.path.join(out_dir, f"plot_radius_{stem}.png"), dpi=self.DPI)
+
+        print(f"Saved plots to {out_dir}")
+        print(f"Saved log to {csv_path}")
 
     def render(self):
         if self.renderer is None:
@@ -939,12 +1087,12 @@ class InitializeFingers:
 
         # --- export and plot results ---
         if self.log:
-            self.export_and_plot(threshold=convergence_threshold)
+            self.export_and_plot()
 
-        if self.loss.item() > 1.0:
-            print("Warning: Loss did not converge properly. Current loss:", self.loss.item())
-            self.init_count += 1
-            return None, None
+        # if self.loss.item() > 1.0:
+        #     print("Warning: Loss did not converge properly. Current loss:", self.loss.item())
+        #     self.init_count += 1
+        #     return None, None
 
         jq = self.model.joint_q.numpy()
         joint_trans = wp.transform(wp.vec3(jq[0], jq[1], jq[2]), 
@@ -958,7 +1106,7 @@ class InitializeFingers:
          
         init_trans = [wp.transform_multiply(body_trans[i], self.init_transforms[i]) for i in range(self.finger_num)]
 
-        self.debug_print_proxy_sdf(state_for_T=self.state1, stride=10)
+        #self.debug_print_proxy_sdf(state_for_T=self.state1, stride=10)
 
         # after convergence / before return
         self.capture_proxy_points_frozen() # for viz of cloth proxy points

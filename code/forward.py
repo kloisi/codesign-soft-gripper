@@ -1,3 +1,5 @@
+# forward.py
+
 import math
 import os
 import time
@@ -19,11 +21,17 @@ from tendon_model import TendonModelBuilder, TendonRenderer, TendonHolder
 from init_pose import InitializeFingers
 from force_optimizer import FEMForceOptimization
 
-import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, FFMpegWriter
 from scipy.spatial.transform import Rotation as R
 
-from quick_viz import quick_visualize
+from quick_viz import quick_visualize, plot_last_frame_with_voxels
+
+from enclosed_volume_voxel import (
+    VoxelFillConfig,
+    VoxelVolumeEstimator,
+    prepare_vox_topology_from_model,
+)
+
 
 @wp.kernel
 def update_materials(
@@ -42,23 +50,6 @@ def update_materials(
     tet_materials[tid, 0] = k_mu
     tet_materials[tid, 1] = k_lambda
 
-@wp.kernel
-def sample_logk(
-    kernel_seed: wp.int32,
-    min_val: wp.float32, max_val: wp.float32,
-    log_K: wp.array(dtype=wp.float32)):
-    tid = wp.tid()
-    state = wp.rand_init(kernel_seed, tid)
-    log_K[tid] = wp.randf(state, min_val, max_val)
-
-@wp.kernel
-def apply_gravity(
-    gravity: wp.vec3,
-    body_mass: wp.array(dtype=wp.float32),
-    body_f: wp.array(dtype=wp.spatial_vector)
-    ):
-    tid = wp.tid()
-    wp.atomic_add(body_f, tid, wp.spatial_vector(0.0, 0.0, 0.0, 0.0, 1.0*gravity[1] * body_mass[tid], 0.0))
 
 class FEMTendon:
     def __init__(self, 
@@ -73,10 +64,11 @@ class FEMTendon:
                  ycb_object_name='',
                  object_density=1e1,
                  finger_len=9, finger_rot=np.pi/9, finger_width=0.08, scale=4.0, finger_transform=None,
-                 finger_num=2,
+                 finger_num=6,
                  requires_grad=True,
                  init_finger=None,
-                 no_cloth=False):
+                 no_cloth=False,
+                 no_voxvol=False):
         self.verbose = verbose
         self.save_log = save_log
         fps = 4000
@@ -105,9 +97,19 @@ class FEMTendon:
         self.has_object = bool(self.ycb_object_name)
 
         self.no_cloth = bool(no_cloth)
-        
+        self.no_voxvol = bool(no_voxvol)
+
+        # mw_added, todo: check again if these are good
+        self.init_voxel_volume = None
+        self.last_voxel_volume = None
+        self.last_voxel_debug = None
+        self._last_voxel_q = None
+
         self.curr_dir = os.path.dirname(os.path.realpath(__file__))
-        self.stage_path = self.curr_dir + "/../output/" + stage_path + "_" + f"{ycb_object_name}_{log_prefix}_frame{num_frames}" + ".usd"
+        if stage_path is None: # so we can run sweeps without rendering
+            self.stage_path = None
+        else:
+            self.stage_path = self.curr_dir + "/../output/" + stage_path + "_" + f"{ycb_object_name}_{log_prefix}_frame{num_frames}" + ".usd"
 
         save_dir = self.curr_dir + "/../data_gen/" + f"{ycb_object_name}_frame{num_frames}/rand/"
         if save_log and (not os.path.exists(save_dir)):
@@ -137,6 +139,30 @@ class FEMTendon:
             add_drop_cloth=False, # add cloth for dropping test
             )
         self.model = self.builder.model
+
+
+        # --- MW_ADDED, for enclosed volume ---
+        self.voxvol = None
+        if (not self.no_voxvol) and (not self.no_cloth) and self.has_object:
+            cloth_tris, solid_tris, rim_ids = prepare_vox_topology_from_model(self.model)
+
+            cfg = VoxelFillConfig(
+                voxel_size=0.002 * float(self.scale),
+                pad_vox=3,
+                cloth_thickness_vox=1,
+                solid_thickness_vox=1,
+                lid_thickness_vox=1,
+                sample_step_factor=0.5,
+            )
+
+            self.voxvol = VoxelVolumeEstimator(
+                cloth_tri_indices=cloth_tris,
+                solid_tri_indices=solid_tris,
+                rim_ids=rim_ids,
+                cfg=cfg,
+            )
+
+
         self.control = self.model.control(requires_grad=self.requires_grad)
 
         # for quick viz of the YCB object
@@ -167,25 +193,22 @@ class FEMTendon:
         self.init_materials()
 
         # allocate sim states
-        self.states = []
-        for i in range(self.sim_substeps * self.num_frames + 1):
-            self.states.append(self.model.state(requires_grad=self.requires_grad))
-        self.init_particle_q = self.states[0].particle_q.numpy()[0, :]
+        self.state_a = self.model.state(requires_grad=self.requires_grad)
+        self.state_b = self.model.state(requires_grad=self.requires_grad)
+
+        self.init_particle_q = self.state_a.particle_q.numpy()[0, :]
         if self.has_object:
-            self.init_body_q = self.states[0].body_q.numpy()[0, :]
-            self.object_body_f = self.states[0].body_f
-            self.object_q = self.states[0].body_q
+            self.init_body_q = self.state_a.body_q.numpy()[0, :]
+            self.object_body_f = self.state_a.body_f
+            self.object_q = self.state_a.body_q
         else:
             self.init_body_q = None
             self.object_body_f = None
             self.object_q = None
-        self.object_grav = np.zeros(6)
-        self.log_K_list = []
-        self.save_list = []
-        self.mass_list = []
-        self.density_list = [] # EDITED: was missing for some reason, but idk if it matters
-        self.run_name = f"{time.strftime('%Y-%m-%d_%H-%M-%S')}"
-        self.file_name = self.save_dir + f"{self.run_name}.npz"
+
+        # CPU snapshots for quick viz
+        self.saved_particle_q = []
+        self.saved_body_q = []
 
         if self.stage_path and is_render:
             self.renderer = TendonRenderer(self.model, self.stage_path, scaling=1.0)
@@ -200,6 +223,10 @@ class FEMTendon:
             with wp.ScopedCapture() as capture:
                 self.forward()
             self.graph = capture.graph
+
+        self.vol_logger = VolumeLogger()
+        self._vox_calibrated = False
+
 
     def init_tendons(self):
         finger_waypoint_num = [len(self.builder.waypoints[i]) for i in range(self.finger_num)]
@@ -234,7 +261,7 @@ class FEMTendon:
         self.control.vel_values = wp.array(
             np.zeros([1, 3]),
             dtype=wp.vec3, requires_grad=self.requires_grad)
-        self.tendon_forces = wp.array([10.0]*self.finger_num, dtype=wp.float32, requires_grad=self.requires_grad)
+        self.tendon_forces = wp.array([100.0]*self.finger_num, dtype=wp.float32, requires_grad=self.requires_grad)
 
         self.tendon_holder.init_tendon_variables(requires_grad=self.requires_grad)
     
@@ -261,423 +288,257 @@ class FEMTendon:
                 inputs=[self.log_K_warp, self.v, self.tet_block_ids],
                 outputs=[self.model.tet_materials])
 
-    def forward(self):
+    def forward(self, save_stride=1, save_for_viz=False, vox_every=100):
         wp.launch(update_materials,
                 dim=len(self.model.tet_materials),
                 inputs=[self.log_K_warp, self.v,
                         self.tet_block_ids],
                 outputs=[self.model.tet_materials])
 
+        s_curr = self.state_a
+        s_next = self.state_b
+
+        self.saved_particle_q = []
+        self.saved_body_q = []
+
+        if save_for_viz:
+            self.saved_particle_q.append(s_curr.particle_q.numpy().copy())
+            if self.has_object:
+                self.saved_body_q.append(s_curr.body_q.numpy().copy())
+
+        # MW_ADDED, for enclosed volume, one-time rim calibration from q0
+        if (self.voxvol is not None) and (not self.no_cloth) and self.has_object and (not self._vox_calibrated):
+            q0 = s_curr.particle_q.numpy()
+            if q0.ndim == 3:
+                q0 = q0[0]
+            self.voxvol.set_open_rims(q0)
+
+            self._vox_calibrated = True
+
+        # voxel volume at initial state t0
+        if (self.voxvol is not None) and (not self.no_cloth) and self.has_object:
+            q0 = s_curr.particle_q.numpy()
+            if q0.ndim == 3:
+                q0 = q0[0]
+            vol0, dbg0 = self.voxvol.compute(q0, return_points=False)
+            self.init_voxel_volume = float(vol0)
+            if self.verbose:
+                print(
+                    f"[vox] t0 vol={self.init_voxel_volume:.6g} "
+                    f"shape={dbg0.get('shape', None)} enclosed_vox={dbg0.get('enclosed_voxels', None)}"
+                )
+
+        # vox_every = 100 # compute volume every 100 frames
+        vox_every = max(1, vox_every)
+
         for frame in range(self.num_frames):
 
             for i in range(self.sim_substeps):
-                index = i + frame * self.sim_substeps
-                self.states[index].clear_forces()
+                s_curr.clear_forces()
                 self.tendon_holder.reset()
                 if i % 1 == 0: # default was % 20, (computing collisions every 20 substeps)
-                    wp.sim.collide(self.model, self.states[index])
+                    wp.sim.collide(self.model, s_curr)
                 
                 self.control.update_target_vel(frame)
 
                 force = self.tendon_forces
 
-                self.tendon_holder.apply_force(force, self.states[index].particle_q, self.success_flag)
-                self.integrator.simulate(self.model, self.states[index], self.states[index+1], self.sim_dt, self.control)
+                self.tendon_holder.apply_force(force, s_curr.particle_q, self.success_flag)
+                self.integrator.simulate(self.model, s_curr, s_next, self.sim_dt, self.control)
 
-                self.object_body_f = self.states[index].body_f
+                self.object_body_f = s_curr.body_f
 
-        self.object_q = self.states[-1].body_q
-        self.object_body_f = self.states[-1].body_f # body force from last state after integration
-    
-    def simulate(self):
-        # sample random stiffness
-        wp.launch(sample_logk,
-                dim=len(self.log_K_warp),
-                inputs=[self.kernel_seed + self.iter, 13.5, 17.0],
-                outputs=[self.log_K_warp])
-        print(f"iter:{self.iter}, sampled log_K:", self.log_K_warp.numpy()[:10])
+                # ping-pong swap
+                s_curr, s_next = s_next, s_curr
 
-        if not getattr(self, "has_object", True):
-            if self.use_cuda_graph:
-                wp.capture_launch(self.graph)
-            else:
-                self.forward()
-            self.sim_time += self.frame_dt
-            self.iter += 1
-            return
+            if frame == 0 or frame % max(1, self.num_frames // 5) == 0 or frame == (self.num_frames - 1):
+                print(f"frame {frame} / {self.num_frames}: body_f:", self.object_body_f.numpy().flatten())
 
-        # sample density
-        new_density = np.random.uniform(1e0, 1e1)
-        utils.update_object_density(self.model, 0, new_density, self.object_density)
-        self.object_density = new_density
-        print("object density:", self.object_density)
-        print("object mass:", self.model.body_mass.numpy())
+            # MW_ADDED, for enclosed volume
+            s_end = s_curr # after substeps, current state is the end-of-frame state
 
-        if self.use_cuda_graph:
-            wp.capture_launch(self.graph)
-        else:
-            self.forward()
+            is_last_frame = (frame == self.num_frames - 1)
+            do_vol = ((frame % vox_every) == 0) or is_last_frame
 
-        end_particle_q = self.states[-1].particle_q.numpy()[0, :]
-        particle_trans_q = end_particle_q[0:3] - self.init_particle_q[0:3]
-        object_trans_q = self.object_q.numpy()[0, 0:3] - self.init_body_q[0:3]
+            if (self.voxvol is not None) and (not self.no_cloth) and self.has_object and do_vol:
 
-        diff_q = object_trans_q - particle_trans_q
-        wp.sim.collide(self.model, self.states[-1])
-        collide_num = self.model.rigid_contact_count.numpy()
-        print("collision:", collide_num)
+                q_np = s_end.particle_q.numpy()
+                if q_np.ndim == 3:
+                    q_np = q_np[0]
+                elif q_np.ndim == 1:
+                    q_np = q_np.reshape(-1, 3)
 
-        if np.linalg.norm(diff_q) > 1e2:
-            print(f'Error in diff_q {self.ycb_object_name}')
-            return
-        object_body_f = self.object_body_f.numpy().flatten()
-        object_grav = -9.8 * self.model.body_mass.numpy()[0]
-        self.object_grav[4] = object_grav
+                vol_vox, dbg = self.voxvol.compute(q_np, return_points=is_last_frame)
+                self.vol_logger.log(
+                    step=(frame + 1) * self.sim_substeps - 1,
+                    sim_time=(frame + 1) * self.frame_dt, # true end-of-frame time
+                    frame=frame,
+                    substep=self.sim_substeps - 1,
+                    vol=vol_vox,
+                    dbg=dbg,
+                )
+                if is_last_frame:
+                    self.last_voxel_volume = float(vol_vox)
+                    self.last_voxel_debug = dbg
+                    self._last_voxel_q = q_np   # optional, for rim range prints
 
-        if self.success_flag.numpy()[0] == 0:
-            print(f'Error in simulation {self.ycb_object_name}')
-            collide_num += 1
-            diff_q[1] -= 0.1
-            object_body_f += self.object_grav 
-        if np.linalg.norm(object_body_f) < 1e-5:
-            print(f'Zero in object body force {self.ycb_object_name}')
-            collide_num += 1
+            # save sparse CPU snapshots for quick viz
+            if save_for_viz and (((frame + 1) % save_stride) == 0 or is_last_frame):
+                self.saved_particle_q.append(s_curr.particle_q.numpy().copy())
+                if self.has_object:
+                    self.saved_body_q.append(s_curr.body_q.numpy().copy())
 
-        object_body_f += self.object_grav 
-        print(f'{self.ycb_object_name} {self.iter} body_f:', object_body_f)
-        print(f'{self.ycb_object_name} {self.iter} body_q:', diff_q)
-
-        this_output = object_body_f.tolist()
-        this_output += (diff_q).flatten().tolist()
-        this_output += collide_num.flatten().tolist()
-
-        self.save_list.append(this_output)
-        self.log_K_list.append(self.log_K_warp.numpy().flatten().tolist())
-        self.mass_list.append(self.model.body_mass.numpy().flatten().tolist())
-        self.density_list.append([self.object_density])
-
-        if self.save_log:
-            if (self.iter+1) % 10 == 0 or self.iter == self.train_iters - 1:
-                self.save_data()
-        self.sim_time += self.frame_dt
-        self.iter += 1
-    
-    def reset_states(self, finger_mesh):
-        for i in range(self.finger_num):
-            wp.launch(utils.update_particles_input,
-                      dim=len(finger_mesh[i]),
-                      inputs=[self.states[0].particle_q, 
-                              finger_mesh[i],
-                              i*len(finger_mesh[i]),]
-                      )
-        print("reset body_q:", self.states[0].body_q.numpy())
-        self.states[0].body_qd.zero_()
-        self.states[0].particle_qd.zero_()
-        self.success_flag = wp.array([1], dtype=wp.int32, requires_grad=False)
-        self.object_mass = self.model.body_mass.numpy()[0]
-        self.log_K_list = []
-        self.save_list = []
-        self.mass_list = []
-        self.density_list = []
-
-        self.run_name = f"{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S-%f')}"
-        self.file_name = self.save_dir + f"{self.run_name}.npz"
-
-    def save_data(self):
-        np.savez(self.file_name,
-                 log_k=np.array(self.log_K_list),
-                 output=np.array(self.save_list),
-                 init_transform=self.finger_transform,
-                 object_mass=np.array(self.mass_list),
-                 density_list=np.array(self.density_list),)
-        print("Saved data to:", self.file_name)
-
-    def render(self):
-        if self.renderer is None:
-            return
-
-        with wp.ScopedTimer("render", print=False):
-            for i in range(self.num_frames + 1):
+            # render on the fly, doesnt need gpu states anymore
+            if self.renderer is not None:
                 self.renderer.begin_frame(self.render_time)
                 self.renderer.render(
-                    self.states[i * self.sim_substeps], 
-                    np.array(self.builder.waypoint_ids).flatten(), 
+                    s_curr,
+                    np.array(self.builder.waypoint_ids).flatten(),
                     force_scale=0.1)
                 self.renderer.end_frame()
                 self.render_time += self.frame_dt
 
-    def optimize_forces(self, iterations=10, learning_rate=0.1, opt_frames=1000):
-        print(f"--- Optimizing Forces (Numerical SGD) ---")
-        
-        # Configuration
-        epsilon = 10.0
-        current_forces = self.tendon_forces.numpy().copy()
-        num_tendons = len(current_forces)
-        
-        # History tracker
-        history = {
-            "loss": [],
-            "forces": []
-        }
-        
-        for iter_idx in range(iterations):
-            gradients = np.zeros(num_tendons)
-            
-            # 1. Base Run
-            loss_base = FEMForceOptimization.run(
-                torch.tensor(current_forces, dtype=torch.float32, device='cuda'), 
-                self.model, 
-                self.states, 
-                self.integrator, 
-                self.sim_dt, 
-                self.control, 
-                self.tendon_holder, 
-                self.sim_substeps, 
-                opt_frames, 
-                self.builder.finger_vertex_ranges
-            )
-            
-            print(f"Iter {iter_idx}: Base Loss {loss_base:.4f}")
-            
-            # Log Data
-            history["loss"].append(float(loss_base))
-            history["forces"].append(current_forces.copy().tolist())
+        self.state_a, self.state_b = s_curr, s_next
 
-            # 2. Gradient Calculation Loop
-            for t in range(num_tendons):
-                test_forces = current_forces.copy()
-                test_forces[t] += epsilon
-                
-                loss_new = FEMForceOptimization.run(
-                    torch.tensor(test_forces, dtype=torch.float32, device='cuda'),
-                    self.model,
-                    self.states, 
-                    self.integrator, 
-                    self.sim_dt, 
-                    self.control, 
-                    self.tendon_holder, 
-                    self.sim_substeps, 
-                    opt_frames, 
-                    self.builder.finger_vertex_ranges
-                )
-                
-                gradients[t] = (loss_new - loss_base) / epsilon
-            
-            # 3. Update Step
-            current_forces = current_forces - (learning_rate * gradients)
-            current_forces = np.clip(current_forces, 0.0, 100.0)
+        self.object_q = s_curr.body_q
+        self.object_body_f = s_curr.body_f # body force from last state after integration
 
-        # Save Final Result
-        self.tendon_forces = wp.from_numpy(current_forces.astype(np.float32), device='cuda')
-        print(f"--- Done. Final Forces: {current_forces} ---")
-        return history
+        # MW_ADDED, for enclosed volume, save log and print
+        if self.voxvol is not None:
+            obj = self.ycb_object_name if self.ycb_object_name else "noobj"
+            self.vol_logger.to_csv(f"logs/volume_timeseries_{obj}_f{self.finger_num}.csv")
 
-    def optimize_forces_autodiff(self, iterations=10, learning_rate=0.01, opt_frames=1000):
-        print(f"--- Optimizing Forces (Autodiff) ---")
-        
-        # 1. Create Tensor
-        forces_param = torch.tensor(self.tendon_forces.numpy(), device='cuda', requires_grad=True)
-        
-        # 2. Optimizer
-        optimizer = torch.optim.Adam([forces_param], lr=learning_rate)
-        
-        # History tracker
-        history = {
-            "loss": [],
-            "forces": []
-        }
-        
-        for i in range(iterations):
-            optimizer.zero_grad()
-            
-            # 3. Forward Pass
-            loss = FEMForceOptimization.apply(
-                forces_param,
-                self.model, 
-                self.states, 
-                self.integrator, 
-                self.sim_dt, 
-                self.control, 
-                self.tendon_holder, 
-                self.sim_substeps, 
-                opt_frames, 
-                self.builder.finger_vertex_ranges
-            )
-            
-            # Log Data (Before backward/update)
-            history["loss"].append(loss.item())
-            history["forces"].append(forces_param.detach().cpu().numpy().tolist())
-            print(f"Iter {i}: Loss {loss.item():.4f}")
-            
-            # 4. Backward Pass
-            loss.backward()
+            if self.verbose and (self.last_voxel_volume is not None):
+                dbg = self.last_voxel_debug
+                q_np = self._last_voxel_q
+                print(f"[vox] vol={self.last_voxel_volume:.6g} shape={dbg['shape']} enclosed_vox={dbg['enclosed_voxels']}")
+                dv = self.last_voxel_volume - self.init_voxel_volume
+                print(f"[vox] t0={self.init_voxel_volume:.6g} t_end={self.last_voxel_volume:.6g} delta={dv:.6g}")
+                print("[voxdbg]",
+                    "voxel=", dbg["voxel_size"],
+                    "y_bottom=", dbg["y_bottom"],
+                    "y_top=", dbg["y_top"],
+                    "iy_lid=", dbg["iy_lid"],
+                    "blocked=", dbg["blocked_voxels"])
+                print("[voxpts] blocked_pts", dbg["blocked_pts"].shape, "enclosed_pts", dbg["enclosed_pts"].shape)
+                print("[rimT] top ids:", len(self.voxvol.top_rim_ids), "bottom ids:", len(self.voxvol.bottom_rim_ids))
+                print("[rimT] bot_yT range:", q_np[self.voxvol.bottom_rim_ids,1].min(), q_np[self.voxvol.bottom_rim_ids,1].max())
+                print("[rimT] top_yT range:", q_np[self.voxvol.top_rim_ids,1].min(), q_np[self.voxvol.top_rim_ids,1].max())
 
-            # NaN Check and Clipping
-            if forces_param.grad is not None:
-                if torch.isnan(forces_param.grad).any():
-                    print(f"Iter {i}: !!! GRADIENTS ARE NaN !!! Skipping step.")
-                    optimizer.zero_grad()
-                    continue
+            if self.verbose and (self.last_voxel_debug is not None):
+                plot_last_frame_with_voxels(self, self.last_voxel_debug)
+    
 
-                torch.nn.utils.clip_grad_norm_([forces_param], max_norm=1.0)
-            
-            # 5. Step
-            optimizer.step()
-            
-            # Clip forces to valid range
-            with torch.no_grad():
-                forces_param.clamp_(0.0, 100.0)
+    def render(self):
+        return
 
-        # Save Final Result
-        self.tendon_forces = wp.from_torch(forces_param.detach())
-        print(f"--- Done. Final Forces: {forces_param.detach().cpu().numpy()} ---")
-        return history
-
-    def optimize_forces_adam(self, iterations=10, learning_rate=10.0, opt_frames=10):
-        print(f"--- Optimizing Forces (Numerical + Adam) ---")
-        
-        # Configuration
-        epsilon = 15.0 
-        
-        # 1. Setup Tensor
-        forces_param = torch.tensor(self.tendon_forces.numpy(), dtype=torch.float32, device='cuda', requires_grad=True)
-        num_tendons = len(forces_param)
-        
-        # 2. Initialize Adam
-        optimizer = torch.optim.Adam([forces_param], lr=learning_rate)
-        
-        # History tracker
-        history = {
-            "loss": [],
-            "forces": []
-        }
-        
-        for iter_idx in range(iterations):
-            optimizer.zero_grad()
-            
-            # Step A: Base Run
-            forces_np = forces_param.detach().cpu().numpy()
-            
-            loss_base = FEMForceOptimization.run(
-                torch.tensor(forces_np, device='cuda'), 
-                self.model, self.states, self.integrator, self.sim_dt, 
-                self.control, self.tendon_holder, self.sim_substeps, 
-                opt_frames, self.builder.finger_vertex_ranges
-            )
-            
-            print(f"Iter {iter_idx}: Base Loss {loss_base:.4f}")
-            
-            # Log Data
-            history["loss"].append(float(loss_base))
-            history["forces"].append(forces_np.tolist())
-
-            # Step B: Calculate Gradients (Numerical)
-            grads_buffer = np.zeros(num_tendons, dtype=np.float32)
-            
-            for t in range(num_tendons):
-                test_forces = forces_np.copy()
-                test_forces[t] += epsilon
-                
-                loss_new = FEMForceOptimization.run(
-                    torch.tensor(test_forces, device='cuda'),
-                    self.model, self.states, self.integrator, self.sim_dt, 
-                    self.control, self.tendon_holder, self.sim_substeps, 
-                    opt_frames, self.builder.finger_vertex_ranges
-                )
-                
-                # Calculate slope
-                grads_buffer[t] = (loss_new - loss_base) / epsilon
-
-            # Step C: Inject Gradients into Adam
-            forces_param.grad = torch.from_numpy(grads_buffer).to(device='cuda')
-            
-            # Step D: Update
-            optimizer.step()
-            
-            # Clip to valid range
-            with torch.no_grad():
-                forces_param.clamp_(0.0, 100.0)
-
-        # Save Final Result
-        self.tendon_forces = wp.from_torch(forces_param.detach())
-        print(f"--- Done. Final Forces: {forces_param.detach().cpu().numpy()} ---")
-        return history
 
     def optimize_forces_lbfgs(self, iterations=10, learning_rate=1.0, opt_frames=10):
-        print(f"--- Optimizing Forces (Numerical + L-BFGS) ---")
-        
+        """
+        Safer numerical L BFGS:
+        - Perturb forces in force space (delta_force), not latent space
+        - Chain rule to get gradients wrt latents
+        - Strong Wolfe line search for stability
+        """
         max_force = 100.0
-        epsilon = 5.0 
+        delta_force = 1.0
 
-        # x = log(p / (1-p)) where p is percentage of max force
+        # This optimisation path assumes CUDA because FEMForceOptimization.run uses torch tensors on cuda.
+        torch_device = "cuda"
+
+        # create a SHORT temporary state buffer just for optimization
+        opt_state_count = self.sim_substeps * opt_frames + 1
+        opt_states = [self.model.state(requires_grad=self.requires_grad) for _ in range(opt_state_count)]
+
+        # Initialise latents from current forces via inverse sigmoid
         start_vals = self.tendon_forces.numpy() / max_force
-        start_vals = np.clip(start_vals, 0.01, 0.99) # Prevent div by zero
+        start_vals = np.clip(start_vals, 0.01, 0.99)
         start_latents = np.log(start_vals / (1.0 - start_vals))
 
-        #forces_param = torch.tensor(self.tendon_forces.numpy(), dtype=torch.float32, device='cuda', requires_grad=True)
-        latents_param = torch.tensor(start_latents, dtype=torch.float32, device='cuda', requires_grad=True)
+        latents_param = torch.tensor(
+            start_latents, dtype=torch.float32, device=torch_device, requires_grad=True
+        )
         num_tendons = len(latents_param)
-        
-        # L-BFGS Setup
-        optimizer = torch.optim.LBFGS([latents_param], lr=learning_rate, max_iter=5)
-        
-        # History tracker
-        history = {
-            "loss": [],
-            "forces": []
-        }
-        
-        # L-BFGS Closure
+
+        optimizer = torch.optim.LBFGS(
+            [latents_param],
+            lr=learning_rate,
+            max_iter=5,
+            history_size=10,
+            line_search_fn="strong_wolfe",
+        )
+
+        history = {"loss": [], "forces": []}
+
         def closure():
             optimizer.zero_grad()
-            
-            # 1. Base Run
-            current_forces = max_force * torch.sigmoid(latents_param)
+
+            # Forward pass
+            current_forces_pct = torch.sigmoid(latents_param)
+            current_forces = max_force * current_forces_pct
             forces_np = current_forces.detach().cpu().numpy()
-            
+
             loss_base = FEMForceOptimization.run(
-                torch.tensor(forces_np, device='cuda'), 
-                self.model, self.states, self.integrator, self.sim_dt, 
-                self.control, self.tendon_holder, self.sim_substeps, 
-                opt_frames, self.builder.finger_vertex_ranges
+                torch.tensor(forces_np, device=torch_device),
+                self.model,
+                opt_states,
+                self.integrator,
+                self.sim_dt,
+                self.control,
+                self.tendon_holder,
+                self.sim_substeps,
+                opt_frames,
+                self.builder.finger_vertex_ranges,
             )
-            print(f"   L-BFGS Evaluation Loss: {loss_base:.4f}")
-            
-            # Log Data (Note: L-BFGS calls this multiple times per 'step')
-            # We log every evaluation to see the line search progress
+
             history["loss"].append(float(loss_base))
             history["forces"].append(forces_np.tolist())
-            
-            # 2. Gradient Calculation (Numerical)
-            grads_buffer = np.zeros(num_tendons, dtype=np.float32)
-            latents_np = latents_param.detach().cpu().numpy()
+
+            # Allow “evaluation only” runs
+            if learning_rate == 0.0:
+                latents_param.grad = torch.zeros_like(latents_param)
+                return torch.tensor(loss_base, device=torch_device)
+
+            # Numerical gradients wrt FORCE
+            grads_wrt_force = np.zeros(num_tendons, dtype=np.float32)
             for t in range(num_tendons):
-                test_latents = latents_np.copy()
-                test_latents[t] += epsilon
-                test_forces = max_force * (1.0 / (1.0 + np.exp(-test_latents)))
+                test_forces_np = forces_np.copy()
+                test_forces_np[t] += delta_force
+
                 loss_new = FEMForceOptimization.run(
-                    torch.tensor(test_forces, device='cuda'),
-                    self.model, self.states, self.integrator, self.sim_dt, 
-                    self.control, self.tendon_holder, self.sim_substeps, 
-                    opt_frames, self.builder.finger_vertex_ranges
+                    torch.tensor(test_forces_np, device=torch_device),
+                    self.model,
+                    opt_states,
+                    self.integrator,
+                    self.sim_dt,
+                    self.control,
+                    self.tendon_holder,
+                    self.sim_substeps,
+                    opt_frames,
+                    self.builder.finger_vertex_ranges,
                 )
-                grads_buffer[t] = (loss_new - loss_base) / epsilon
-            
-            # 3. Inject Gradient
-            latents_param.grad = torch.from_numpy(grads_buffer).to(device='cuda')
-            
-            return torch.tensor(loss_base)
+
+                grads_wrt_force[t] = (loss_new - loss_base) / delta_force
+
+            # Chain rule: dLoss/dLatent = dLoss/dForce * dForce/dLatent
+            sig = current_forces_pct.detach().cpu().numpy()
+            d_force_d_latent = max_force * sig * (1.0 - sig)
+            final_grads = grads_wrt_force * d_force_d_latent
+
+            latents_param.grad = torch.from_numpy(final_grads).to(device=torch_device)
+
+            print(f"   L BFGS Loss: {loss_base:.4f} | Grads (Latent): {final_grads}")
+            return torch.tensor(loss_base, device=torch_device)
 
         for i in range(iterations):
             print(f"Iter {i}:")
             optimizer.step(closure)
-            
 
-        # Save Final Result
         final_forces = max_force * torch.sigmoid(latents_param)
         self.tendon_forces = wp.from_torch(final_forces.detach())
         print(f"--- Done. Final Forces: {final_forces.detach().cpu().numpy()} ---")
         return history
+
     
     def plot_single_run(self, history, method_name="Optimization", save_dir="logs"):
         """
@@ -745,6 +606,245 @@ class FEMTendon:
         print(f"[{method_name}] Plots saved to {plot_filename}")
         plt.close(fig)
 
+# -------------------------
+# Cloth scaling + debug print (same logic as sweep_stiffness.py)
+# -------------------------
+def _safe_np(x):
+    if hasattr(x, "numpy"):
+        return x.numpy()
+    return np.asarray(x)
+
+
+def _get_cloth_ids_from_tendon(tendon):
+    # Prefer cached tendon.cloth_ids, else model.cloth_particle_ids, else builder
+    if getattr(tendon, "cloth_ids", None) is not None:
+        ids = np.asarray(tendon.cloth_ids, dtype=np.int64).ravel()
+        if ids.size:
+            return ids
+
+    model = getattr(tendon, "model", None)
+    if model is not None and getattr(model, "cloth_particle_ids", None) is not None:
+        try:
+            ids = _safe_np(model.cloth_particle_ids).astype(np.int64).ravel()
+            if ids.size:
+                return ids
+        except Exception:
+            pass
+
+    builder = getattr(tendon, "builder", None)
+    if builder is not None and getattr(builder, "cloth_particle_ids", None) is not None:
+        ids = np.asarray(builder.cloth_particle_ids, dtype=np.int64).ravel()
+        if ids.size:
+            return ids
+
+    return None
+
+
+def _tri_materials_np(model):
+    tri_mats = _safe_np(model.tri_materials)
+    tri_mats = np.asarray(tri_mats, dtype=np.float64)
+    if tri_mats.ndim == 1:
+        tri_mats = tri_mats.reshape(-1, 3)
+    return tri_mats
+
+
+def _tri_indices_np(model):
+    tri_idx = _safe_np(model.tri_indices)
+    tri_idx = np.asarray(tri_idx, dtype=np.int64)
+    if tri_idx.ndim == 1:
+        tri_idx = tri_idx.reshape(-1, 3)
+    return tri_idx
+
+
+def cloth_tri_mask(tendon):
+    model = getattr(tendon, "model", None)
+    if model is None or getattr(model, "tri_indices", None) is None:
+        return None, None, None
+
+    cloth_ids = _get_cloth_ids_from_tendon(tendon)
+    if cloth_ids is None or cloth_ids.size == 0:
+        return None, None, None
+
+    tri_idx = _tri_indices_np(model)
+    mask = np.isin(tri_idx, cloth_ids).any(axis=1)
+    if not np.any(mask):
+        return tri_idx, mask, cloth_ids
+
+    return tri_idx, mask, cloth_ids
+
+
+def print_cloth_material_stats(tendon, tag="", max_examples=3):
+    model = getattr(tendon, "model", None)
+    if model is None or getattr(model, "tri_materials", None) is None:
+        print(f"[cloth_mats]{tag} model.tri_materials missing")
+        return
+
+    tri_idx, mask, cloth_ids = cloth_tri_mask(tendon)
+    if tri_idx is None or mask is None:
+        print(f"[cloth_mats]{tag} no cloth ids / tri indices found")
+        return
+
+    tri_mats = _tri_materials_np(model)
+
+    n_total = int(tri_mats.shape[0])
+    n_cloth = int(np.sum(mask)) if mask is not None else 0
+    if n_cloth == 0:
+        print(f"[cloth_mats]{tag} cloth tris=0/{n_total} (mask empty)")
+        return
+
+    names = ["ke", "ka", "kd"]
+    stats_str = []
+    for j, nm in enumerate(names):
+        v = tri_mats[mask, j]
+        v = v[np.isfinite(v)]
+        if v.size == 0:
+            stats_str.append(f"{nm}=nan")
+            continue
+        stats_str.append(
+            f"{nm}: mean={np.mean(v):.4g} std={np.std(v):.3g} min={np.min(v):.4g} max={np.max(v):.4g}"
+        )
+
+    print(f"[cloth_mats]{tag} cloth tris={n_cloth}/{n_total} | " + " | ".join(stats_str))
+
+    ex = tri_mats[mask, :3]
+    ex = ex[: max_examples, :]
+    print(f"[cloth_mats]{tag} examples [ke, ka, kd] (first {ex.shape[0]} cloth tris):\n{ex}")
+
+
+def scale_cloth_stiffness(tendon, factor_ke_ka=1.0, factor_kd=1.0, debug=False):
+    model = getattr(tendon, "model", None)
+    if model is None or getattr(model, "tri_indices", None) is None or getattr(model, "tri_materials", None) is None:
+        print("[scale_cloth_stiffness] model tri data missing")
+        return
+
+    tri_idx, mask, cloth_ids = cloth_tri_mask(tendon)
+    if tri_idx is None or mask is None:
+        print("[scale_cloth_stiffness] no cloth ids / tri indices; nothing to scale")
+        return
+    if not np.any(mask):
+        print("[scale_cloth_stiffness] mask empty; no cloth tris found")
+        return
+
+    if debug:
+        print_cloth_material_stats(tendon, tag=" BEFORE_STIFF_SCALE")
+
+    tri_mats = _tri_materials_np(model).astype(np.float32, copy=False)
+
+    tri_mats[mask, 0] *= float(factor_ke_ka)  # ke
+    tri_mats[mask, 1] *= float(factor_ke_ka)  # ka
+    tri_mats[mask, 2] *= float(factor_kd)     # kd
+
+    model.tri_materials = wp.array(tri_mats, dtype=wp.float32, device=wp.get_device())
+    print(f"[scale_cloth_stiffness] scaled {int(np.sum(mask))} cloth tris: ke/ka x{factor_ke_ka} kd x{factor_kd}")
+
+    if debug:
+        print_cloth_material_stats(tendon, tag=" AFTER_STIFF_SCALE")
+
+
+def scale_cloth_mass(tendon, mass_factor: float, debug=False):
+    model = getattr(tendon, "model", None)
+    if model is None or getattr(model, "particle_inv_mass", None) is None:
+        print("[scale_cloth_mass] model or particle_inv_mass missing")
+        return
+
+    cloth_ids = _get_cloth_ids_from_tendon(tendon)
+    if cloth_ids is None or cloth_ids.size == 0:
+        print("[scale_cloth_mass] No cloth ids found; nothing to scale.")
+        return
+
+    inv_m = _safe_np(model.particle_inv_mass).astype(np.float32)
+
+    if debug:
+        before = inv_m[cloth_ids].copy()
+
+    for gid in cloth_ids:
+        if inv_m[gid] > 0.0:
+            m = 1.0 / inv_m[gid]
+            m *= float(mass_factor)
+            inv_m[gid] = 1.0 / max(m, 1e-12)
+
+    model.particle_inv_mass = wp.array(inv_m, dtype=wp.float32, device=wp.get_device())
+    print(f"[scale_cloth_mass] scaled {len(cloth_ids)} cloth vertices by mass_factor={mass_factor}")
+
+    if debug:
+        after = inv_m[cloth_ids]
+        # show a tiny summary
+        b = 1.0 / np.maximum(before, 1e-12)
+        a = 1.0 / np.maximum(after, 1e-12)
+        print(f"[scale_cloth_mass] cloth mass stats: mean before={np.mean(b):.4g} after={np.mean(a):.4g} (ratio~{np.mean(a)/np.mean(b):.3g})")
+
+
+def print_mass_breakdown(tendon):
+    """MW_ADDED"""
+
+    m_model = tendon.model
+    print("\nMASSES IN SCENE:")
+    # rigid body (YCB, coral, ...)
+    if m_model.body_count:
+        body_masses = m_model.body_mass.numpy()
+        for i, m in enumerate(body_masses):
+            print(f" body {i+1} mass: {m:.6f} kg")
+    else:
+        print("No rigid bodies in model.")
+
+    # particle masses (fingers + cloth)
+    inv_m = m_model.particle_inv_mass.numpy() # 1/mass
+    masses = np.zeros_like(inv_m)
+    mask = inv_m > 0.0
+    masses[mask] = 1.0 / inv_m[mask]
+
+    # print(f" Total particle mass (fingers + cloth): {masses.sum():.6f} kg")
+
+    # cloth mass
+    cloth_ids = getattr(tendon.builder, "drop_cloth_ids", None)
+    if cloth_ids is None and getattr(tendon.builder, "cloth_particle_ids", None) is not None:
+        cloth_ids = tendon.builder.cloth_particle_ids
+
+    if cloth_ids is not None:
+        cloth_mass = masses[cloth_ids].sum()
+        print(f" Cloth mass: {cloth_mass:.6f} kg")
+    else:
+        print(" No cloth ids found on builder.")
+
+    # finger mass (everything that is not cloth)
+    all_ids = np.arange(m_model.particle_count)
+    if cloth_ids is not None:
+        finger_ids = np.setdiff1d(all_ids, cloth_ids)
+    else:
+        finger_ids = all_ids
+
+    finger_mass = masses[finger_ids].sum()
+    print(f" Finger (soft body) mass: {finger_mass:.6f} kg\n")
+
+
+
+# MW_ADDED, for enclosed volume,
+class VolumeLogger:
+    def __init__(self):
+        self.rows = []
+
+    def log(self, step, sim_time, frame, substep, vol, dbg=None):
+        row = {
+            "step": int(step),
+            "t": float(sim_time),
+            "frame": int(frame),
+            "substep": int(substep),
+            "vol_vox": float(vol),
+        }
+        # optional debugs
+        if dbg is not None:
+            row.update({
+                "enclosed_voxels": int(dbg.get("enclosed_voxels", -1)),
+                "blocked_voxels": int(dbg.get("blocked_voxels", -1)),
+                "y_bottom": float(dbg.get("y_bottom", np.nan)),
+                "y_top": float(dbg.get("y_top", np.nan)),
+            })
+        self.rows.append(row)
+
+    def to_csv(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        pd.DataFrame(self.rows).to_csv(path, index=False)
+
     
 if __name__ == "__main__":
     import argparse
@@ -759,7 +859,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--num_frames", type=int, default=1000, help="Total number of frames per training iteration.")
     parser.add_argument("--stiff_iters", type=int, default=3, help="Total number of sampling stiffness iterations.")
-    parser.add_argument("--pose_iters", type=int, default=10000, help="Total number of pose iterations.")
+    parser.add_argument("--pose_iters", type=int, default=1000, help="Total number of pose iterations.")
     parser.add_argument("--object_name", type=str, default="006_mustard_bottle", help="Name of the object to load.")
     parser.add_argument("--object_density", type=float, default=2e0, help="Density of the object.")
     parser.add_argument("--verbose", action="store_true", help="Print out additional status messages during execution.")
@@ -784,8 +884,17 @@ if __name__ == "__main__":
     parser.add_argument("--quick_viz_azim", type=float, default=45, help="Camera azimuth.")
 
     # optimizer choice
-    parser.add_argument("--optimizer", type=str, default="lbfgs", choices=["sgd", "adam", "autodiff", "lbfgs"], help="Choose the optimization method.")
+    parser.add_argument("--optimizer", type=str, default="lbfgs", choices=["lbfgs"], help="Choose the optimization method.")
     parser.add_argument("--no_force_opt", action="store_true", help="Disable force optimization.")
+
+    # expensive logging
+    parser.add_argument("--no_voxvol", action="store_true", help="Disable voxel enclosed volume computation.")
+
+    parser.add_argument("--cloth_stiff_scale", type=float, default=1.0, help="Multiply cloth ke/ka by this factor.")
+    parser.add_argument("--cloth_damp_scale", type=float, default=1.0, help="Multiply cloth kd by this factor.")
+    parser.add_argument("--cloth_mass_scale", type=float, default=1.0, help="Multiply cloth mass by this factor.")
+    parser.add_argument("--debug_cloth_mats", action="store_true", help="Print cloth tri ke/ka/kd stats before/after scaling.")
+
 
     args = parser.parse_known_args()[0]
 
@@ -862,10 +971,33 @@ if __name__ == "__main__":
             finger_num=args.finger_num,
             requires_grad=True,
             init_finger=init_finger,
-            no_cloth=args.no_cloth)
+            no_cloth=args.no_cloth,
+            no_voxvol=args.no_voxvol)
+        
+        print_mass_breakdown(tendon)
         
         if init_finger is not None and getattr(init_finger, "proxy_pts_frozen", None) is not None:
             tendon.proxy_pts_frozen = init_finger.proxy_pts_frozen
+
+        # --- apply cloth scaling exactly like sweep_stiffness.py (mass first, then ke/ka + kd)
+        if not args.no_cloth:
+            if args.debug_cloth_mats:
+                print_cloth_material_stats(tendon, tag=" BEFORE_ANY_SCALING")
+
+            if args.cloth_mass_scale != 1.0:
+                scale_cloth_mass(tendon, args.cloth_mass_scale, debug=False)
+
+            if (args.cloth_stiff_scale != 1.0) or (args.cloth_damp_scale != 1.0):
+                scale_cloth_stiffness(
+                    tendon,
+                    factor_ke_ka=args.cloth_stiff_scale,
+                    factor_kd=args.cloth_damp_scale,
+                    debug=args.debug_cloth_mats,   # prints before/after stiff scaling
+                )
+
+            if args.debug_cloth_mats:
+                print_cloth_material_stats(tendon, tag=" AFTER_ANY_SCALING")
+
 
         # --- optimize forces ---
         history = None
@@ -873,28 +1005,9 @@ if __name__ == "__main__":
 
         if not args.no_force_opt:
             print(f"--- Running optimization using: {method_name.upper()} ---")
-            
-            if method_name == "sgd":
-                history = tendon.optimize_forces(
-                    iterations=10, learning_rate=0.1, opt_frames=100
-                )
-            
-            elif method_name == "adam":
-                history = tendon.optimize_forces_adam(
-                    iterations=20, learning_rate=10.0, opt_frames=100
-                )
-            
-            elif method_name == "autodiff":
-                # Autodiff needs a much smaller LR
-                history = tendon.optimize_forces_autodiff(
-                    iterations=10, learning_rate=0.01, opt_frames=100
-                )
-            
-            elif method_name == "lbfgs":
-                # LBFGS usually runs fewer iterations but does more work per step
-                history = tendon.optimize_forces_lbfgs(
-                    iterations=1, learning_rate=1.0, opt_frames=100
-                )
+            history = tendon.optimize_forces_lbfgs(
+                iterations=1, learning_rate=1.0, opt_frames=100
+            )
 
             # --- Automatic Plotting ---
             if history is not None:
@@ -903,10 +1016,14 @@ if __name__ == "__main__":
                 print("No optimization run (history is None).")
 
 
-        tendon.forward()
-        if args.is_render:
-            tendon.render()
+        tendon.forward(
+            save_stride=args.quick_viz_stride,
+            save_for_viz=args.quick_viz,
+        )
+
+        if args.is_render and tendon.renderer is not None:
             tendon.renderer.save()
+
         # ADDED
         if args.quick_viz:
             quick_visualize(
