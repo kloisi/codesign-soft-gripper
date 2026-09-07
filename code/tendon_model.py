@@ -1,3 +1,5 @@
+# tendon_model.py
+
 import numpy as np
 import warp as wp
 import warp.sim.render
@@ -585,11 +587,17 @@ class TendonModelBuilder(ModelBuilder):
                     edge_a="left",
                     edge_b="right",
                     dx_nominal=cell_size[0],
-                    mass_per_vertex=1e-4, # for 18x18 cloth: 18*18*0.0001 = 0.0324 = 30g
-                    tri_ke=1.0e1,
-                    tri_ka=1.0e1,
+                    mass_per_vertex=2.5e-5,
+                    tri_ke=1.0e0,
+                    tri_ka=1.0e0,
                     tri_kd=1.0e0,
                 )
+                """
+                mass_per_vertex=7.14e-6,
+                    tri_ke=2.0e-1,
+                    tri_ka=2.0e-1,
+                    tri_kd=2.0e-1,
+                """
 
 
         # --- Merge all cloth particles into one list for cloth-finger collisions / viz ---
@@ -780,17 +788,13 @@ class TendonModelBuilder(ModelBuilder):
         # Choose attachment nodes in local finger coords, before transform
         # We split into the two edges, then store both and also a combined list.
 
-        num_attach_per_edge = 18
-
         edge_lo_ids = self.select_cloth_finger_attachment_ids(
             finger_index=index,
             which="edge_lo",
-            num_attach=num_attach_per_edge,
         )
         edge_hi_ids = self.select_cloth_finger_attachment_ids(
             finger_index=index,
             which="edge_hi",
-            num_attach=num_attach_per_edge,
         )
 
         # Store per-edge for connecting cloth
@@ -885,7 +889,7 @@ class TendonModelBuilder(ModelBuilder):
 
         p_start = len(self.particle_q) # save cloth particle ids to enable cloth-finger collision
 
-        cloth_scale = 0.01 # 0.01
+        cloth_scale = 1.0 # 0.01
 
         self.add_cloth_grid(
             pos=cloth_pos,
@@ -1062,7 +1066,6 @@ class TendonModelBuilder(ModelBuilder):
         self,
         finger_index: int,
         which: str = "spine", # "edge_lo", "edge_hi"
-        num_attach: int = 18,
     ):
         """
         MW_ADDED
@@ -1079,8 +1082,6 @@ class TendonModelBuilder(ModelBuilder):
         3) Sort those candidates along local x (finger length)
 
         4) Interpret them as 3 'rows' according to layout and select spine, edges or all
-
-        5) Subsample to num_attach points
         """
 
         finger_ids = self.finger_particle_ids[finger_index]
@@ -1182,11 +1183,6 @@ class TendonModelBuilder(ModelBuilder):
         xs_sel = P_sel[:, 0]
         order_sel = np.argsort(xs_sel)
         ids = ids[order_sel]
-
-        # subsample along length to num_attach points
-        if num_attach is not None and num_attach > 0 and ids.size > num_attach:
-            idxs = np.linspace(0, ids.size - 1, num_attach).astype(int)
-            ids = ids[idxs]
 
         return ids.tolist()
 

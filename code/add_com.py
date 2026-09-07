@@ -1,3 +1,5 @@
+# add_com.py
+
 import os, numpy as np, trimesh as tm
 from pathlib import Path
 
